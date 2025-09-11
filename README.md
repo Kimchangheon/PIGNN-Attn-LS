@@ -1,4 +1,3 @@
-Here’s a GitHub-friendly Markdown version you can drop into your README. It uses `###` headers, numbered lists, and GitHub’s built-in math support with `$…$` and `$$…$$` (no LaTeX environments like `\subsection`, `enumerate`, or `multline`).
 
 ---
 
@@ -128,3 +127,47 @@ For the attention variant, compute the physics features as in **M2** and then re
    This replaces the entire concatenated feature: the **M3** update heads now take \$\operatorname{ctx}\_i^{(k)}\$ alone, since \$(V,\theta,\Delta P,\Delta Q,m)\$ already condition the attention via \$(q,k,v)\$.
 
 > **Notes.** Attention operates only on existing edges (no dense \$N^2\$ attention) with a per-destination softmax; when logits are uniform it reduces to a degree-normalized neighbor average.
+
+3.1 Sampling Pipeline
+
+This repository synthesizes AC power-flow (PF) scenarios and computes reference solutions with Newton–Raphson (NR). NR is used only to generate benchmark states for evaluation; training remains physics-informed (no NR labels).
+
+Steps (S1–S9)
+	1.	S1 — Choose regime and size
+Draw a voltage regime g ∈ {MVN, HVN} and a bus count N ∈ [4, 32]. Assign base quantities (U_base, S_base) by regime.
+	2.	S2 — Sample line parameters and lengths
+For each unordered bus pair (i, j), draw a line length L_ij and per-km series parameters (R′, X′) within operator-typical ranges. Form series impedance and admittance (engineering units):
+$$
+Z_{ij} = (R’ + jX’),L_{ij}, \qquad Y_{ij} = \frac{1}{Z_{ij}}.
+$$
+Ranges reflect realistic R/X (higher at MV; X > R at HV) and overhead-line statistics.
+	3.	S3 — Random topology + connectivity
+Sample an undirected edge set over N buses. Ensure the slack bus reaches all others via BFS; only connected draws proceed.
+	4.	S4 — Shunt charging (π-model)
+Draw per-km shunt capacitance C′ by regime, set ω = 2πf with f = 50 Hz, and assign half to each line end:
+$$
+b_{ij}^{\text{sh}} = \tfrac{1}{2},\omega,C’ , L_{ij}.
+$$
+Accumulate per-bus shunt: B_i^{sh} = Σ_j b_{ij}^{sh}.
+	5.	S5 — Assemble nodal admittance
+Build the bus admittance matrix Y \in \mathbb{C}^{N\times N} in π-model form:
+$$
+Y_{ij}=
+\begin{cases}
+-y_{ij}, & i\neq j \text{ and line } (i,j) \text{ exists},\
+\sum\limits_{k\in \mathcal{N}(i)} y_{ik} + j,B_i^{\text{sh}}, & i = j,\
+0, & \text{otherwise.}
+\end{cases}
+$$
+	6.	S6 — Assign bus types
+Fix bus 1 as Slack. Assign each remaining bus independently as PV or PQ to obtain a realistic Slack/PV/PQ mix for MV and HV.
+	7.	S7 — Sample operating point
+Draw bus injections (P_i, Q_i) by regime and type: Slack (0, 0), PV (P_i, 0), PQ (P_i, Q_i). Magnitudes follow the ranges in your parameter table. Form complex power S_i = P_i + jQ_i and the system vector S.
+	8.	S8 — Initial voltages
+Set complex initial guesses U^(0): Slack/PV magnitudes uniform in [0.9, 1.1] p.u., PQ at 1.0 p.u., zero phase. Convert using U_base.
+	9.	S9 — Reference PF solution (NR)
+Run NR for up to K iterations on (Y, S) under Slack/PV/PQ constraints to obtain (U*, S*). Mark non-convergent or disconnected cases; exclude them from metrics unless noted.
+
+Notes
+	•	Symbols: j is the engineering imaginary unit; p.u. denotes per-unit.
+	•	MVN/HVN parameter ranges (e.g., R′, X′, C′, L) should be specified in your table or config for reproducibility.
