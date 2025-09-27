@@ -4,15 +4,13 @@
 """
 High-throughput parallel data generator with a custom Parquet writer (no database module).
 
-Key features
-- CPU-saturating multiprocessing with batched tasks
-- Single-writer, append-by-row-group Parquet output (fast + safe)
-- Arrays (including complex) stored as compact .npy bytes in Parquet binary columns
-- BLAS thread limiting to avoid over-subscription across processes
+Changes
+- REMOVED I_newton from Parquet schema, records, and reader.
+- ADDED --save_y_matrix / --no_save_y_matrix CLI flags (default: save).
 
 Usage example:
   python generate.py --runs 150000 --save_steps 10000 --gridtype HVN \
-                     --min_number_of_buses 4 --max_number_of_buses 32
+                     --min_number_of_buses 4 --max_number_of_buses 32 --no_save_y_matrix
 """
 
 # ---- Prevent BLAS/numexpr oversubscription (set BEFORE numpy import) ----
@@ -53,7 +51,6 @@ def ndarray_to_npy_bytes(x: Any) -> bytes:
     if not isinstance(x, np.ndarray):
         x = np.asarray(x)
     buf = io.BytesIO()
-    # allow_pickle=False keeps things safer and schema-stable
     np.save(buf, x, allow_pickle=False)
     return buf.getvalue()
 
@@ -71,29 +68,21 @@ def npy_bytes_to_ndarray(b: bytes) -> np.ndarray:
 class ParquetAppendWriter:
     """
     Single-file Parquet writer that appends row groups as you flush buffers.
-    We define a fixed Arrow schema up front so each append is O(1) open/close.
+    The Arrow schema is defined at init and can optionally include Y_matrix.
     """
 
-    _schema = pa.schema([
-        pa.field('bus_number', pa.int32()),
-        pa.field('gridtype', pa.string()),
-        pa.field('U_base', pa.float64()),
-        pa.field('S_base', pa.float64()),
-        # All large, structured values encoded as .npy bytes (binary)
-        pa.field('bus_typ', pa.binary()),
-        pa.field('Y_Lines', pa.binary()),
-        pa.field('Y_C_Lines', pa.binary()),
-        pa.field('Lines_connected', pa.binary()),
-        pa.field('Y_matrix', pa.binary()),
-        pa.field('u_start', pa.binary()),
-        pa.field('u_newton', pa.binary()),
-        pa.field('S_start', pa.binary()),
-        pa.field('S_newton', pa.binary()),
-        pa.field('I_newton', pa.binary()),
-    ])
-
-    def __init__(self, path: str, compression: str = "zstd", compression_level: int = 3, overwrite: bool = True):
+    def __init__(
+        self,
+        path: str,
+        compression: str = "zstd",
+        compression_level: int = 3,
+        overwrite: bool = True,
+        save_y_matrix: bool = True,
+    ):
         self.path = path
+        self._compression_level = compression_level
+        self.save_y_matrix = bool(save_y_matrix)
+
         # Ensure parent directory exists
         parent = os.path.dirname(os.path.abspath(path))
         if parent and not os.path.exists(parent):
@@ -102,13 +91,33 @@ class ParquetAppendWriter:
         if overwrite and os.path.exists(path):
             os.remove(path)
 
+        # Build schema dynamically (I_newton removed; Y_matrix optional)
+        fields = [
+            pa.field('bus_number', pa.int32()),
+            pa.field('gridtype', pa.string()),
+            pa.field('U_base', pa.float64()),
+            pa.field('S_base', pa.float64()),
+            pa.field('bus_typ', pa.binary()),
+            pa.field('Y_Lines', pa.binary()),
+            pa.field('Y_C_Lines', pa.binary()),
+            pa.field('Lines_connected', pa.binary()),
+        ]
+        if self.save_y_matrix:
+            fields.append(pa.field('Y_matrix', pa.binary()))
+        fields.extend([
+            pa.field('u_start', pa.binary()),
+            pa.field('u_newton', pa.binary()),
+            pa.field('S_start', pa.binary()),
+            pa.field('S_newton', pa.binary()),
+        ])
+        self._schema = pa.schema(fields)
+
         self._writer = pq.ParquetWriter(
             where=path,
             schema=self._schema,
             compression=compression,
             use_dictionary=True
         )
-        self._compression_level = compression_level
 
     def write_records(self, records: List[Dict[str, Any]]):
         """Convert a list of dicts into a single Arrow table and append it."""
@@ -125,12 +134,11 @@ class ParquetAppendWriter:
         Y_Lines = []
         Y_C_Lines = []
         Lines_connected = []
-        Y_matrix = []
+        Y_matrix = []  # only used if self.save_y_matrix
         u_start = []
         u_newton = []
         S_start = []
         S_newton = []
-        I_newton = []
 
         # Tight loop for speed
         for r in records:
@@ -151,12 +159,14 @@ class ParquetAppendWriter:
             Y_Lines.append(r['Y_Lines'])
             Y_C_Lines.append(r['Y_C_Lines'])
             Lines_connected.append(r['Lines_connected'])
-            Y_matrix.append(r['Y_matrix'])
+
+            if self.save_y_matrix:
+                Y_matrix.append(r['Y_matrix'])
+
             u_start.append(r['u_start'])
             u_newton.append(r['u_newton'])
             S_start.append(r['S_start'])
             S_newton.append(r['S_newton'])
-            I_newton.append(r['I_newton'])
 
         arrays = [
             pa.array(bus_number, type=pa.int32()),
@@ -167,13 +177,15 @@ class ParquetAppendWriter:
             pa.array(Y_Lines, type=pa.binary()),
             pa.array(Y_C_Lines, type=pa.binary()),
             pa.array(Lines_connected, type=pa.binary()),
-            pa.array(Y_matrix, type=pa.binary()),
+        ]
+        if self.save_y_matrix:
+            arrays.append(pa.array(Y_matrix, type=pa.binary()))
+        arrays.extend([
             pa.array(u_start, type=pa.binary()),
             pa.array(u_newton, type=pa.binary()),
             pa.array(S_start, type=pa.binary()),
             pa.array(S_newton, type=pa.binary()),
-            pa.array(I_newton, type=pa.binary()),
-        ]
+        ])
 
         table = pa.Table.from_arrays(arrays, schema=self._schema)
         self._writer.write_table(table)
@@ -192,13 +204,13 @@ def get_parquet_file_size(path: str) -> int:
 def read_first_row_parquet(path: str) -> Dict[str, Any]:
     """
     Lightweight peek at the first row. For binary columns we load back to ndarrays.
+    Handles presence/absence of Y_matrix; I_newton removed.
     Intended only for debugging small samples.
     """
     pf = pq.ParquetFile(path)
     tb = pf.read_row_group(0)
-    # extract row 0 as Python objects
     row = {name: tb.column(i)[0].as_py() for i, name in enumerate(tb.schema.names)}
-    # decode binary -> ndarray for convenience
+
     out = {
         'bus_number': row['bus_number'],
         'gridtype': row['gridtype'],
@@ -208,13 +220,13 @@ def read_first_row_parquet(path: str) -> Dict[str, Any]:
         'Y_Lines': npy_bytes_to_ndarray(row['Y_Lines']),
         'Y_C_Lines': npy_bytes_to_ndarray(row['Y_C_Lines']),
         'Lines_connected': npy_bytes_to_ndarray(row['Lines_connected']),
-        'Y_matrix': npy_bytes_to_ndarray(row['Y_matrix']),
         'u_start': npy_bytes_to_ndarray(row['u_start']),
         'u_newton': npy_bytes_to_ndarray(row['u_newton']),
         'S_start': npy_bytes_to_ndarray(row['S_start']),
         'S_newton': npy_bytes_to_ndarray(row['S_newton']),
-        'I_newton': npy_bytes_to_ndarray(row['I_newton']),
     }
+    if 'Y_matrix' in row:
+        out['Y_matrix'] = npy_bytes_to_ndarray(row['Y_matrix'])
     return out
 
 
@@ -222,7 +234,6 @@ def read_first_row_parquet(path: str) -> Dict[str, Any]:
 # Multiprocessing worker machinery
 # ==================================
 _CFG: Dict[str, Any] = {}
-
 
 # global per-process RNG (store it so your worker functions can use it)
 _RNG = None
@@ -233,7 +244,6 @@ def _init_worker(cfg: dict, seed_base: int):
     pid = os.getpid()
     ss = np.random.SeedSequence([seed_base & 0xFFFFFFFF, pid & 0xFFFFFFFF])
     _RNG = np.random.default_rng(ss)
-    # If you still have legacy code using np.random.*, you can ALSO set:
     np.random.seed(int(ss.generate_state(1, dtype=np.uint32)[0]))
 
 
@@ -247,6 +257,8 @@ def _generate_one_record_serialized() -> Dict[str, Any]:
     fixed = _CFG['fixed']
     min_buses = _CFG['min_buses']
     max_buses = _CFG['max_buses']
+    save_y_matrix = _CFG['save_y_matrix']
+
     debugging = False
     pic = False
 
@@ -262,15 +274,18 @@ def _generate_one_record_serialized() -> Dict[str, Any]:
         gridtype, bus_number, fixed, debugging, pic
     )
 
-    Y_matrix_flatten = Y_matrix.copy().flatten().astype(complex)
+    # Only prepare flattened Y_matrix if we plan to save it
+    ymat_bytes = None
+    if save_y_matrix:
+        ymat_bytes = ndarray_to_npy_bytes(Y_matrix.copy().flatten().astype(complex))
 
     if not is_connected:
         # If topology is disconnected, keep schema but zero-out solution arrays
         u_newton = np.zeros_like(u_start, dtype=complex)
-        I_newton = np.zeros_like(u_start, dtype=complex)
         S_newton = np.zeros_like(u_start, dtype=complex)
     else:
-        u_newton, I_newton, S_newton = newtonrapson(
+        # newtonrapson returns (u_newton, I_newton, S_newton); we ignore I_newton entirely
+        u_newton, _I_unused, S_newton = newtonrapson(
             bus_typ, Y_matrix.copy(), s_multi.copy(), u_start.copy(),
             K=K
         )
@@ -286,13 +301,14 @@ def _generate_one_record_serialized() -> Dict[str, Any]:
         'Y_Lines': ndarray_to_npy_bytes(Y_Lines),
         'Y_C_Lines': ndarray_to_npy_bytes(Y_C_Lines),
         'Lines_connected': ndarray_to_npy_bytes(Lines_connected),
-        'Y_matrix': ndarray_to_npy_bytes(Y_matrix_flatten),
         'u_start': ndarray_to_npy_bytes(u_start),
         'u_newton': ndarray_to_npy_bytes(u_newton),
         'S_start': ndarray_to_npy_bytes(s_multi),
         'S_newton': ndarray_to_npy_bytes(S_newton),
-        'I_newton': ndarray_to_npy_bytes(I_newton),
     }
+    if save_y_matrix:
+        rec['Y_matrix'] = ymat_bytes
+
     return rec
 
 
@@ -327,6 +343,15 @@ def parse_args():
     parser.add_argument('--workers', type=int, default=0,
                         help='Number of worker processes. 0 = use all logical CPUs.')
     parser.add_argument('--overwrite', action='store_true', help='Overwrite output file if it already exists.')
+
+    # New: choose whether to save Y_matrix
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument('--save_y_matrix', dest='save_y_matrix', action='store_true',
+                       help='Save Y_matrix bytes (default).')
+    group.add_argument('--no_save_y_matrix', dest='save_y_matrix', action='store_false',
+                       help='Do not save Y_matrix to Parquet.')
+    parser.set_defaults(save_y_matrix=True)
+
     return parser.parse_args()
 
 
@@ -342,6 +367,7 @@ def main():
     max_buses = int(args.max_number_of_buses)
     rows_per_task = max(int(args.rows_per_task), 1)
     workers = args.workers if args.workers and args.workers > 0 else (os.cpu_count() or 1)
+    save_y_matrix = bool(args.save_y_matrix)
 
     # Output path: single Parquet file
     filename = os.path.join(
@@ -352,11 +378,12 @@ def main():
 
     # Build config for workers
     cfg = dict(
-        K = K,
+        K=K,
         gridtype=gridtype,
         fixed=fixed,
         min_buses=min_buses,
         max_buses=max_buses,
+        save_y_matrix=save_y_matrix,
     )
 
     # Tasking plan
@@ -373,9 +400,15 @@ def main():
     start = time.time()
 
     # Create writer up-front (single file)
-    writer = ParquetAppendWriter(filename, compression="zstd", compression_level=3, overwrite=args.overwrite)
+    writer = ParquetAppendWriter(
+        filename,
+        compression="zstd",
+        compression_level=3,
+        overwrite=args.overwrite,
+        save_y_matrix=save_y_matrix,
+    )
 
-    print(f"[INFO] Starting generation with {workers} workers, {num_tasks} tasks, rows_per_task={rows_per_task}, save_steps={save_steps}")
+    print(f"[INFO] Starting generation with {workers} workers, {num_tasks} tasks, rows_per_task={rows_per_task}, save_steps={save_steps}, save_y_matrix={save_y_matrix}")
 
     buffer: List[Dict[str, Any]] = []
     try:

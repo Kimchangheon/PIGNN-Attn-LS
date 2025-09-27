@@ -3,33 +3,16 @@ import torch.nn as nn
 from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
 
 from torch.utils.data import DataLoader, random_split
-from GNN.SimpleGNN.GNSNode import GNSNode
-from GNN.SimpleGNN.GNSMsg import GNSMsg as GNSMsg
-from GNN.SimpleGNN.GNSMsg_armijo import GNSMsg as GNSMsg_armijo
-from GNN.SimpleGNN.GNSMsg_armijo_5think import GNSMsg as GNSMsg_armijo
 
-from GNN.SimpleGNN.GNSMsg_SelfAttention_armijo import  GNSMsg_EdgeSelfAttn
-from GNN.SimpleGNN.GNSMsg_SelfAttention_armijo_5think import  GNSMsg_EdgeSelfAttn
 
-# from GNN.SimpleGNN.GNSMsg_adaptive import GNSMsg
+from GNSMsg_SelfAttention_armijo import GNSMsg_EdgeSelfAttn
+from GNSMsg_armijo import GNSMsg
 
-# from GNN.SimpleGNN.GNSMsg_armijo_lazy import GNSMsg
-
-# from GNN.SimpleGNN.GNSMsg_armijo_r_i import GNSMsg
-
-# from GNN.SimpleGNN.GNSMsg_scale_invariant import GNSMsg
-# from GNN.SimpleGNN.GNSMsg_GEMM import GNSMsg
-
-from GNN.SimpleGNN.GNSMsgGRU_armijo import GNSMsgGRU
-
-# from GNN.SimpleGNN.Dataset import ChanghunDataset
-from GNN.SimpleGNN.Dataset_optimized import ChanghunDataset
-from GNN.SimpleGNN.Dataset_optimized_complex_columns import ChanghunDataset
+from Dataset_optimized_complex_columns import ChanghunDataset
 
 
 from helper import *
 # from collate_blockdiag import *
-from collate_blockdiag_optimized import *
 from collate_blockdiag_optimized_complex_columns import *
 
 import multiprocessing as mp
@@ -61,16 +44,16 @@ parser.add_argument('--mode', type=str, default="train_test", help='train_valid_
 parser.add_argument("--mag_ang_mse", action="store_true", help="normalised |V| + wrapped-angle loss ")
 
 parser.add_argument('--model', type=str, default="GNSMsg_EdgeSelfAttn", help='GNSMsg, GNSMsgGRU, etc')
-parser.add_argument("--d", type=int, default=8, help="model input dim")
-parser.add_argument("--d_hi", type=int, default=32, help="model hidden dim")
-parser.add_argument("--K", type=int, default=80, help="K")
+parser.add_argument("--d", type=int, default=4, help="model input dim")
+parser.add_argument("--d_hi", type=int, default=16, help="model hidden dim")
+parser.add_argument("--K", type=int, default=40, help="K")
 parser.add_argument('--gamma', type=float, default=0.9, help='phys_loss decay over K')
 parser.add_argument("--use_armijo", action="store_true", help="use_armijo")
 parser.add_argument("--vlimit", action="store_true", help="vlimit disabled")
 parser.add_argument('--DthetaMax', type=float, default=0.3, help='DthetaMax')
 parser.add_argument('--DvmFrac', type=float, default=0.1, help='DvmFrac')
-parser.add_argument('--train_ratio', type=float, default=0.3333, help='DvmFrac')
-parser.add_argument('--valid_ratio', type=float, default=0.3333, help='DvmFrac')
+parser.add_argument('--train_ratio', type=float, default=0.8, help='train_ratio')
+parser.add_argument('--valid_ratio', type=float, default=0.1, help='valid_ratio')
 
 
 parser.add_argument("--ADJ_MODE", type=str, default="cplx", help="Adjacency mode: real | cplx | other")
@@ -87,14 +70,14 @@ parser.add_argument("--EPOCHS", type=int, default=20, help="Number of training e
 parser.add_argument("--LR", type=float, default=1e-4, help="Learning rate")
 parser.add_argument("--VAL_EVERY", type=int, default=1, help="Validation frequency (in epochs)")
 # parser.add_argument("--PARQUET", type=str, default="./data/MVN_15000_armijo_4_to_32_buses.parquet", help="Path to Parquet data file")
-parser.add_argument("--PARQUET", type=str, nargs='+', default=["./data/MVN_15000_armijo_4_to_32_buses.parquet"], help="Path to Parquet data file(s)")
+parser.add_argument("--PARQUET", type=str, nargs='+', default=["./data/HVN_15000_NR_plain_4_to_32_buses.parquet"], help="Path to Parquet data file(s)")
 parser.add_argument("--seed_value", type=int, default=42, help="Batch size")
 
 args = parser.parse_args()
 
 SEED = args.seed_value
 # Assign to variables if needed
-PINN       = args.PINN
+PINN       = True
 
 # Extract just the filename without extension
 parquet_filenames = [os.path.splitext(os.path.basename(p))[0] for p in args.PARQUET]
@@ -216,37 +199,12 @@ else :
 
 print(f"Dataset sizes  |  train {n_train}   valid {n_val}   test {n_test}")
 
-# # ── utils ---------------------------------------------------------
-def compute_norm_stats(dataset: torch.utils.data.Dataset):
-    """Return (μ_bus, σ_bus, μ_edge, σ_edge) as 1-D tensors.
-       bus-feat order = (|V|, θ, ΔP, ΔQ); edge-feat order = (G, B)"""
-    bus_feats, edge_feats = [], []
-
-    for s in dataset:               # <-- iterates over the *training subset* only
-        v, th = s['V_start'][..., 0], s['V_start'][..., 1]
-        dP    = s['P_newton'] - s['P_start']
-        dQ    = s['Q_newton'] - s['Q_start']
-        bus_feats.append(torch.stack([v, th, dP, dQ], -1).reshape(-1, 4))
-
-        Yr, Yi = s['Ybus_real'], s['Ybus_imag']
-        edge_feats.append(torch.stack([Yr, Yi], -1).reshape(-1, 2))
-
-    bus_feat  = torch.cat(bus_feats,  0).float()
-    edge_feat = torch.cat(edge_feats, 0).float()
-    μ_bus,  σ_bus  = bus_feat.mean(0),  bus_feat.std(0).clamp_min(1e-6)
-    μ_edge, σ_edge = edge_feat.mean(0), edge_feat.std(0).clamp_min(1e-6)
-    return μ_bus, σ_bus, μ_edge, σ_edge
-# -----------------------------------------------------------------
-
-# μ_bus, σ_bus, μ_edge, σ_edge = compute_norm_stats(train_ds)
-# print('μ_bus', μ_bus, '\nσ_bus', σ_bus, '\nμ_edge', μ_edge, '\nσ_edge', σ_edge)
-
 # ------------------------------------------------------------------
 # 3.  Model / Optim / Loss
 # ------------------------------------------------------------------
 
 if args.model =="GNSMsg" :
-    model = GNSMsg_armijo(d=d, d_hi=d_hi, K=K, pinn=PINN, gamma=GAMMA, v_limit=VLIMIT, use_armijo=args.use_armijo).to(device)
+    model = GNSMsg(d=d, d_hi=d_hi, K=K, pinn=PINN, gamma=GAMMA, v_limit=VLIMIT, use_armijo=args.use_armijo).to(device)
 elif args.model =="GNSMsg_EdgeSelfAttn" :
     model = GNSMsg_EdgeSelfAttn(d=d, d_hi=d_hi, K=K, pinn=PINN, gamma=GAMMA, v_limit=VLIMIT, use_armijo=args.use_armijo).to(device)
 # model = model.double()
@@ -340,7 +298,9 @@ def run_epoch(loader, *, train: bool, pinn: bool):
 
             bus_type = batch["bus_type"].to(device)
             Line    = batch["Lines_connected"].to(device)
-            Y       = batch["Ybus"].to(device)
+            # Y       = batch["Ybus"].to(device)
+            Y_raw = batch.get("Ybus", None)
+            Y = Y_raw.to(device, non_blocking=True) if isinstance(Y_raw, torch.Tensor) else None
             Ys       = batch["Y_Lines"].to(device)
             Yc       = batch["Y_C_Lines"].to(device)
 

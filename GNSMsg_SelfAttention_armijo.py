@@ -200,61 +200,135 @@ class GNSMsg_EdgeSelfAttn(nn.Module):
         return pairs
 
     def forward(self, bus_type, Line, Y, Ys, Yc, S, V0, n_nodes_per_graph):
+        """
+        If Y is None, construct the dense admittance matrix from upper-tri edges (Line) and per-line Ys, Yc.
+        Otherwise, use the provided Y. Works for block-diag batching (B==1, N=sum(subgraphs)) and plain batching.
+        """
         device = bus_type.device
-        B, N = bus_type.shape  # for blockdiag batching, B==1 and N==sum of subgraphs
+        B, N = bus_type.shape
 
-        Ysr, Ysi = Ys.real, Ys.imag
         P_set, Q_set = S.real, S.imag
-
-        v  = V0[..., 0].clone()
+        v = V0[..., 0].clone()
         th = V0[..., 1].clone()
-        m  = torch.zeros(B, N, self.d, device=device)
+        m = torch.zeros(B, N, self.d, device=device)
 
-        # -------- build edge lists once (outside K loop) --------
+        # ---- Helper: fast dense Y assembly from undirected edges ----
+        def _build_dense_Y(N_local, edges_undirected, ys_edge, yc_edge):
+            """
+            edges_undirected: (E,2) long (global node indices)
+            ys_edge: (E,) complex (series admittances)
+            yc_edge: (E,) complex/real (line charging contribution per bus)
+            """
+            if edges_undirected.numel() == 0:
+                # No lines -> zero matrix (no separate shunt provided).
+                dtype = ys_edge.dtype if ys_edge.numel() else torch.complex64
+                return torch.zeros(N_local, N_local, dtype=dtype, device=device)
+
+            i = edges_undirected[:, 0]
+            j = edges_undirected[:, 1]
+
+            if not torch.is_complex(ys_edge):
+                ys_edge = ys_edge.to(torch.complex64)
+            yc_edge = yc_edge.to(ys_edge.dtype)
+
+            Yloc = torch.zeros(N_local, N_local, dtype=ys_edge.dtype, device=device)
+
+            # Off-diagonals: Y_ij = Y_ji = -Ys
+            Yloc.index_put_((i, j), -ys_edge, accumulate=True)
+            Yloc.index_put_((j, i), -ys_edge, accumulate=True)
+
+            # Diagonals: sum incident series + charging
+            diag = torch.zeros(N_local, dtype=ys_edge.dtype, device=device)
+            diag.index_add_(0, i, ys_edge)
+            diag.index_add_(0, j, ys_edge)
+            diag.index_add_(0, i, yc_edge)
+            diag.index_add_(0, j, yc_edge)
+
+            Yloc.diagonal().add_(diag)
+            return Yloc
+
+        # -------- Build edge lists (once) and optionally Y --------
         if n_nodes_per_graph is not None:
+            # Block-diag batching (recommended): B==1; treat lines as 1D concatenated per-graph
             Line = Line.squeeze(0) if Line.dim() == 2 else Line
-            Ysr, Ysi, Yc = Ysr.squeeze(0), Ysi.squeeze(0), Yc.squeeze(0)
+            Ys = Ys.squeeze(0)
+            Yc = Yc.squeeze(0)
+
+            Ysr, Ysi = Ys.real, Ys.imag
 
             edge_index_parts, edge_feat_parts = [], []
+            ys_parts, yc_parts = [], []
             ptr = 0
             offset = 0
             for n in n_nodes_per_graph:
+                n = int(n)
                 e_all = n * (n - 1) // 2
-                mask_g = Line[ptr:ptr + e_all]
+                mask_g = Line[ptr:ptr + e_all].bool()
                 if mask_g.any():
-                    pairs_g = self._pairs_for_n(int(n), device)              # (e_all,2)
-                    e_idx_g = pairs_g[mask_g] + offset
+                    pairs_g = self._pairs_for_n(n, device)  # (e_all, 2) local pairs
+                    e_idx_g = pairs_g[mask_g] + offset  # globalize
                     edge_index_parts.append(e_idx_g)
-                    feat_g = torch.stack([Ysr[ptr:ptr+e_all][mask_g],
-                                          Ysi[ptr:ptr+e_all][mask_g],
-                                          Yc[ptr:ptr+e_all][mask_g]], dim=-1)
+
+                    # edge features for attention blocks
+                    feat_g = torch.stack([Ysr[ptr:ptr + e_all][mask_g],
+                                          Ysi[ptr:ptr + e_all][mask_g],
+                                          Yc[ptr:ptr + e_all][mask_g].to(Ysr.dtype)], dim=-1)
                     edge_feat_parts.append(feat_g)
+
+                    ys_parts.append(Ys[ptr:ptr + e_all][mask_g])
+                    yc_parts.append(Yc[ptr:ptr + e_all][mask_g])
                 ptr += e_all
-                offset += int(n)
+                offset += n
 
             if edge_index_parts:
-                undirected = torch.cat(edge_index_parts, dim=0)             # (E,2)
-                edge_feat  = torch.cat(edge_feat_parts, dim=0)              # (E,3)
+                undirected = torch.cat(edge_index_parts, dim=0)  # (E,2)
+                edge_feat = torch.cat(edge_feat_parts, dim=0)  # (E,3)
+                ys_edge = torch.cat(ys_parts, dim=0)  # (E,)
+                yc_edge = torch.cat(yc_parts, dim=0)  # (E,)
             else:
                 undirected = torch.empty(0, 2, dtype=torch.long, device=device)
-                edge_feat  = torch.empty(0, 3, dtype=Ysr.dtype, device=device)
+                edge_feat = torch.empty(0, 3, dtype=Ysr.dtype, device=device)
+                ys_edge = torch.empty(0, dtype=Ys.dtype, device=device)
+                yc_edge = torch.empty(0, dtype=Ys.real.dtype, device=device)
 
             # directed duplication for attention
             edge_index_dir = torch.cat([undirected, undirected[:, [1, 0]]], dim=0)  # (2E,2)
-            edge_feat_dir  = torch.cat([edge_feat,  edge_feat], dim=0)              # (2E,3)
-        else:
-            # plain batching (fallback): build per-graph directed edges
-            pairs = self._pairs_for_n(N, device)  # assume all items share N
-            edge_index_dir_list, edge_feat_dir_list = [], []
-            for b in range(B):
-                mask = Line[b]
-                e = pairs[mask]
-                feat_b = torch.stack([Ysr[b, mask], Ysi[b, mask], Yc[b, mask]], dim=-1)
-                edge_index_dir_list.append(torch.cat([e, e[:, [1, 0]]], dim=0))
-                edge_feat_dir_list.append(torch.cat([feat_b, feat_b], dim=0))
+            edge_feat_dir = torch.cat([edge_feat, edge_feat], dim=0)  # (2E,3)
 
+            # Build Y only if needed
+            if Y is None:
+                Y = _build_dense_Y(N, undirected, ys_edge, yc_edge)  # (N,N) for B==1
+
+        else:
+            # Plain batching fallback (all graphs share N)
+            pairs = self._pairs_for_n(N, device)
+            edge_index_dir_list, edge_feat_dir_list = [], []
+            Y_list = [] if Y is None else None
+
+            for b in range(B):
+                mask = Line[b].bool()
+                e_b = pairs[mask]
+                Ysr_b, Ysi_b, Yc_b = Ys[b].real, Ys[b].imag, Yc[b]
+
+                if e_b.numel() > 0:
+                    feat_b = torch.stack([Ysr_b[mask], Ysi_b[mask], Yc_b[mask].to(Ysr_b.dtype)], dim=-1)
+                    edge_index_dir_list.append(torch.cat([e_b, e_b[:, [1, 0]]], dim=0))
+                    edge_feat_dir_list.append(torch.cat([feat_b, feat_b], dim=0))
+                else:
+                    edge_index_dir_list.append(torch.empty(0, 2, dtype=torch.long, device=device))
+                    edge_feat_dir_list.append(torch.empty(0, 3, dtype=Ysr_b.dtype, device=device))
+
+                if Y is None:
+                    ys_edge_b = Ys[b][mask]
+                    yc_edge_b = Yc[b][mask]
+                    Y_list.append(_build_dense_Y(N, e_b, ys_edge_b, yc_edge_b))
+
+            if Y is None:
+                Y = torch.stack(Y_list, dim=0)  # (B,N,N)
+
+        # Masks
         slack_mask = (bus_type == 1)
-        pv_mask    = (bus_type == 2)
+        pv_mask = (bus_type == 2)
 
         if self.pinn:
             phys_loss = torch.zeros(1, device=device)
@@ -263,16 +337,17 @@ class GNSMsg_EdgeSelfAttn(nn.Module):
         for k in range(self.K):
             # power mismatches
             Vc = v * torch.exp(1j * th)
-            Ic = torch.matmul(Y, Vc.unsqueeze(-1)).squeeze(-1)
+            Ic = torch.matmul(Y, Vc.unsqueeze(-1)).squeeze(-1)  # supports (N,N) or (B,N,N)
             Sc = Vc * Ic.conj()
             DP = (P_set - Sc.real)
             DQ = (Q_set - Sc.imag)
             DP = DP.masked_fill(slack_mask, 0.0)
             DQ = DQ.masked_fill(slack_mask | pv_mask, 0.0)
 
-            bus_feat = torch.stack([v, th, DP, DQ], dim=-1)   # (B,N,4)
+            bus_feat = torch.stack([v, th, DP, DQ], dim=-1)  # (B,N,4)
             ctx = self.in_proj(torch.cat([bus_feat, m], dim=-1))
 
+            # GNN message passing
             if n_nodes_per_graph is not None:
                 x = ctx
                 for blk in self.blocks:
@@ -282,72 +357,66 @@ class GNSMsg_EdgeSelfAttn(nn.Module):
                 for b in range(B):
                     if edge_index_dir_list[b].numel() == 0:
                         continue
-                    xb = x[b:b+1]
+                    xb = x[b:b + 1]
                     e_b, ef_b = edge_index_dir_list[b], edge_feat_dir_list[b]
                     for blk in self.blocks:
                         xb = blk(xb, e_b, ef_b)
-                    x[b:b+1] = xb
+                    x[b:b + 1] = xb
 
             dth = self.theta_head[k](x).squeeze(-1)
-            dv  = self.v_head[k](x).squeeze(-1)
-            dm  = torch.tanh(self.m_head[k](x))
-            dm  = F.layer_norm(dm, dm.shape[-1:])
+            dv = self.v_head[k](x).squeeze(-1)
+            dm = torch.tanh(self.m_head[k](x))
+            dm = F.layer_norm(dm, dm.shape[-1:])
 
             # constraints
-            dth = dth.clone(); dv = dv.clone()
+            dth = dth.clone();
+            dv = dv.clone()
             dth = dth.masked_fill(slack_mask, 0.0)
-            dv  = dv.masked_fill(slack_mask | pv_mask, 0.0)
+            dv = dv.masked_fill(slack_mask | pv_mask, 0.0)
 
             if self.v_limit:
                 dtheta_max = 0.30
-                dvm_frac   = 0.10
+                dvm_frac = 0.10
                 v_abs = v.abs()
                 dth = torch.clamp(dth, -dtheta_max, dtheta_max)
-                dv  = torch.clamp(dv, -dvm_frac * v_abs, dvm_frac * v_abs)
+                dv = torch.clamp(dv, -dvm_frac * v_abs, dvm_frac * v_abs)
 
-            # -------- Armijo (vectorized tries) --------
+            # ---- Armijo line search (optional) ----
             if self.use_armijo:
                 v_min, v_max = 0.8, 1.2
                 F0 = _batched_mismatch_inf_norm(Y, v, th, P_set, Q_set, slack_mask, pv_mask)
 
-                # Try several alphas in parallel (one batched matmul)
-                # tune depth as needed (trade accuracy vs speed)
                 alphas = v.new_tensor([1.0, 0.5, 0.25, 0.125, 0.0625])
                 T = alphas.numel()
 
                 v_try = torch.clamp(v.unsqueeze(0) + alphas.view(T, 1, 1) * dv.unsqueeze(0), v_min, v_max)
-                th_try = th.unsqueeze(0) + alphas.view(T, 1, 1) * dth.unsqueeze(0)
-                th_try = (th_try + math.pi) % (2 * math.pi) - math.pi
+                th_try = (th.unsqueeze(0) + alphas.view(T, 1, 1) * dth.unsqueeze(0) + math.pi) % (2 * math.pi) - math.pi
 
-                # Evaluate F for all alphas at once
-                F_all = []
-                for t in range(T):
-                    F_all.append(_batched_mismatch_inf_norm(Y, v_try[t], th_try[t], P_set, Q_set, slack_mask, pv_mask))
-                F_all = torch.stack(F_all)  # (T,)
+                F_all = torch.stack([
+                    _batched_mismatch_inf_norm(Y, v_try[t], th_try[t], P_set, Q_set, slack_mask, pv_mask)
+                    for t in range(T)
+                ])
 
                 c1 = 1e-4
                 cond = F_all <= (1.0 - c1 * alphas) * F0
                 if cond.any():
                     t_sel = int(torch.nonzero(cond, as_tuple=False)[0].item())
                     a = float(alphas[t_sel])
-                    v = v_try[t_sel]
-                    th = th_try[t_sel]
+                    v, th = v_try[t_sel], th_try[t_sel]
                     m = m + a * dm
                 else:
-                    # tiny nudge if it helps
                     a = float(alphas[-1])
                     v2 = torch.clamp(v + a * dv, v_min, v_max)
-                    th2 = th + a * dth
-                    th2 = (th2 + math.pi) % (2 * math.pi) - math.pi
+                    th2 = (th + a * dth + math.pi) % (2 * math.pi) - math.pi
                     if _batched_mismatch_inf_norm(Y, v2, th2, P_set, Q_set, slack_mask, pv_mask) < F0:
                         v, th, m = v2, th2, m + a * dm
             else:
                 th = (th + dth + math.pi) % (2 * math.pi) - math.pi
-                v  = torch.clamp(v + dv, 0.8, 1.2)
-                m  = m + dm
+                v = torch.clamp(v + dv, 0.8, 1.2)
+                m = m + dm
 
             if self.pinn:
-                phys_loss = phys_loss + (self.gamma ** (self.K - 1 - k)) * ((DP**2 + DQ**2).mean())
+                phys_loss = phys_loss + (self.gamma ** (self.K - 1 - k)) * ((DP ** 2 + DQ ** 2).mean())
 
         out = torch.stack([v, th], dim=-1)
         return (out, phys_loss) if self.pinn else out
