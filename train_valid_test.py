@@ -46,6 +46,8 @@ parser.add_argument("--mag_ang_mse", action="store_true", help="normalised |V| +
 parser.add_argument('--model', type=str, default="GNSMsg_EdgeSelfAttn", help='GNSMsg, GNSMsgGRU, etc')
 parser.add_argument("--d", type=int, default=4, help="model input dim")
 parser.add_argument("--d_hi", type=int, default=16, help="model hidden dim")
+parser.add_argument("--num_attn_layers", type=int, default=1, help="model hidden dim")
+
 parser.add_argument("--K", type=int, default=40, help="K")
 parser.add_argument('--gamma', type=float, default=0.9, help='phys_loss decay over K')
 parser.add_argument("--use_armijo", action="store_true", help="use_armijo")
@@ -206,7 +208,7 @@ print(f"Dataset sizes  |  train {n_train}   valid {n_val}   test {n_test}")
 if args.model =="GNSMsg" :
     model = GNSMsg(d=d, d_hi=d_hi, K=K, pinn=PINN, gamma=GAMMA, v_limit=VLIMIT, use_armijo=args.use_armijo).to(device)
 elif args.model =="GNSMsg_EdgeSelfAttn" :
-    model = GNSMsg_EdgeSelfAttn(d=d, d_hi=d_hi, K=K, pinn=PINN, gamma=GAMMA, v_limit=VLIMIT, use_armijo=args.use_armijo).to(device)
+    model = GNSMsg_EdgeSelfAttn(d=d, d_hi=d_hi, K=K, pinn=PINN, gamma=GAMMA, v_limit=VLIMIT, use_armijo=args.use_armijo, num_attn_layers=args.num_attn_layers).to(device)
 # model = model.double()
 
 def init_weights(model, exclude_modules):

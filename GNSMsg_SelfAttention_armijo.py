@@ -383,7 +383,7 @@ class GNSMsg_EdgeSelfAttn(nn.Module):
 
             # ---- Armijo line search (optional) ----
             if self.use_armijo:
-                v_min, v_max = 0.8, 1.2
+                v_min, v_max = 0.75, 1.2
                 F0 = _batched_mismatch_inf_norm(Y, v, th, P_set, Q_set, slack_mask, pv_mask)
 
                 alphas = v.new_tensor([1.0, 0.5, 0.25, 0.125, 0.0625])
@@ -412,7 +412,7 @@ class GNSMsg_EdgeSelfAttn(nn.Module):
                         v, th, m = v2, th2, m + a * dm
             else:
                 th = (th + dth + math.pi) % (2 * math.pi) - math.pi
-                v = torch.clamp(v + dv, 0.8, 1.2)
+                v = torch.clamp(v + dv, 0.75, 1.2)
                 m = m + dm
 
             if self.pinn:

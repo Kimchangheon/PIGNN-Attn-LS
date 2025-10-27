@@ -129,26 +129,43 @@ class ChanghunDataset(Dataset):
 
             # ──────────────────────────────────────────────
             # 2) Per-unit outlier analysis/removal (u_newton)
-            #    (bounded memory via reservoir sampling)
+            #    (bounded memory via exact reservoir sampling)
             # ──────────────────────────────────────────────
             OUTLIER_K = 1.5
             SAMPLE_CAP = 2_000_000  # max elements kept per channel (real/imag)
 
-            def _iqr_bounds(arr: np.ndarray, k: float) -> Optional[tuple[float, float]]:
+            def _report_bounds_and_pct(name: str, arr: np.ndarray, k: float, cap: int):
+                """
+                Print IQR bounds and % of sample values outside bounds; returns (lower, upper).
+                Works on a bounded-memory reservoir sample.
+                """
+                arr = np.asarray(arr, dtype=np.float32)
+                arr = arr[np.isfinite(arr)]
                 if arr.size == 0:
-                    return None
+                    print(f"No per-unit {name} data to analyze.")
+                    return None, None
+
                 q1, q3 = np.percentile(arr, [25, 75])
                 iqr = q3 - q1
-                return float(q1 - k * iqr), float(q3 + k * iqr)
+                lower, upper = q1 - k * iqr, q3 + k * iqr
 
-            # exact reservoir sampling (Algorithm R), vectorized per batch
+                mask_out = (arr < lower) | (arr > upper)
+                n_out = int(mask_out.sum())
+                pct_out = (100.0 * n_out / arr.size) if arr.size else 0.0
+
+                print(f"\n>>> Per-Unit {name} Outlier Analysis (sample) <<<")
+                print(f"  Samples: {arr.size}  (cap={cap})")
+                print(f"  Q1={q1:.3e}, Q3={q3:.3e}, IQR={iqr:.3e}")
+                print(f"  Bounds = [{lower:.3e}, {upper:.3e}]")
+                print(f"  Outliers = {n_out} ({pct_out:.2f}%)")
+                print(f"  Span = [{arr.min():.3e}, {arr.max():.3e}]")
+                return float(lower), float(upper)
+
+            # exact reservoir sampling (Vitter's Algorithm R), streaming & vectorized over each batch
             def _reservoir_add(sample_r, sample_i, r, i, rng, total_seen):
                 """
                 Maintain fixed-size reservoirs sample_r/sample_i (size ≤ SAMPLE_CAP) with new arrays r/i.
-                Uses Vitter's Algorithm R exactly:
-                  - fill to capacity with a random subset of new elements
-                  - for each subsequent element at position t (1-based stream index), draw j~Unif{1..t};
-                    if j <= SAMPLE_CAP, replace reservoir[j-1] with this element.
+                Stream order is the row order; we fill then replace exactly per Algorithm R.
                 Args:
                   sample_r, sample_i: 1D float32 reservoirs (same length)
                   r, i:                1D float32 arrays of new real/imag values (same length)
@@ -158,51 +175,42 @@ class ChanghunDataset(Dataset):
                   (sample_r, sample_i, total_seen)
                 """
                 cap = SAMPLE_CAP
-                n_new = r.size
-                if n_new == 0:
+                n = r.size
+                if n == 0:
                     return sample_r, sample_i, total_seen
 
                 size = sample_r.size
 
-                # ---- Fill phase: bring reservoir up to capacity (if not full) ----
+                # ---- Fill phase: take the first 'need' stream elements in order ----
                 if size < cap:
                     need = cap - size
-                    if n_new <= need:
-                        # append all new data
-                        sample_r = np.concatenate((sample_r, r))
-                        sample_i = np.concatenate((sample_i, i))
-                        total_seen += n_new
+                    take = min(need, n)
+                    if take:
+                        sample_r = np.concatenate((sample_r, r[:take]))
+                        sample_i = np.concatenate((sample_i, i[:take]))
+                        total_seen += take
+                    # remaining new elements for replacement phase
+                    r = r[take:]
+                    i = i[take:]
+                    n = r.size
+                    if n == 0:
                         return sample_r, sample_i, total_seen
-                    else:
-                        # append a random subset of the new data to fill the reservoir
-                        idx_fill = rng.choice(n_new, size=need, replace=False)
-                        sample_r = np.concatenate((sample_r, r[idx_fill]))
-                        sample_i = np.concatenate((sample_i, i[idx_fill]))
-                        # keep the remaining elements for replacement phase
-                        mask_fill = np.ones(n_new, dtype=bool)
-                        mask_fill[idx_fill] = False
-                        r = r[mask_fill]
-                        i = i[mask_fill]
-                        n_new = r.size
-                        total_seen += need
-                        size = cap  # now full
+                    size = sample_r.size  # should be cap now if take==need
 
                 # ---- Replacement phase (exact Algorithm R) ----
-                # For the remaining n_new elements, their stream positions are:
-                # t = total_seen + 1, total_seen + 2, ..., total_seen + n_new
-                # Draw j_l ~ Unif{1..t_l}; replace if j_l <= cap
-                t_vals = total_seen + np.arange(1, n_new + 1, dtype=np.int64)
-                # rng.integers(low, high) draws in [low, high); need [1..t] inclusive → high=t+1
-                j = rng.integers(1, t_vals + 1)
+                # For remaining n elements, positions are t = total_seen+1 .. total_seen+n
+                t_vals = total_seen + np.arange(1, n + 1, dtype=np.int64)
+                j = rng.integers(1, t_vals + 1)  # j ~ Unif{1..t}
                 sel = (j <= cap)
                 if sel.any():
                     repl_idx = (j[sel] - 1).astype(np.int64)  # indices in [0..cap-1]
-                    src_idx = np.nonzero(sel)[0].astype(np.int64)  # which new elements to use
+                    src_idx = np.nonzero(sel)[0].astype(np.int64)
                     sample_r[repl_idx] = r[src_idx]
                     sample_i[repl_idx] = i[src_idx]
 
-                total_seen += n_new
+                total_seen += n
                 return sample_r, sample_i, total_seen
+
             if "u_newton" in df.columns:
                 if "U_base" not in df.columns:
                     print("⚠️  Skipping per-unit outlier removal: 'U_base' column not found.")
@@ -218,7 +226,6 @@ class ChanghunDataset(Dataset):
                     for cell, u_base in zip(df["u_newton"], u_bases):
                         if not np.isfinite(u_base) or u_base == 0:
                             continue
-                        # try to avoid heavy conversions
                         a = np.asarray(cell)
                         if a.size == 0:
                             continue
@@ -235,34 +242,24 @@ class ChanghunDataset(Dataset):
 
                         sample_r, sample_i, total_seen = _reservoir_add(sample_r, sample_i, r, i, rng, total_seen)
 
-                    # Compute IQR bounds on the sample only
-                    b_real = _iqr_bounds(sample_r, OUTLIER_K)
-                    b_imag = _iqr_bounds(sample_i, OUTLIER_K)
+                    # Compute & print IQR bounds + % outside (sample-based)
+                    lr, ur = _report_bounds_and_pct("u_newton Real", sample_r, OUTLIER_K, SAMPLE_CAP)
+                    li, ui = _report_bounds_and_pct("u_newton Imag", sample_i, OUTLIER_K, SAMPLE_CAP)
 
-                    # Optional: quick report (cheap; sample-based)
-                    if sample_r.size or sample_i.size:
-                        def _report(name, arr):
-                            if arr.size == 0:
-                                print(f"No per-unit {name} data to analyze.")
-                                return
-                            q1, q3 = np.percentile(arr, [25, 75])
-                            iqr = q3 - q1
-                            lower, upper = q1 - OUTLIER_K * iqr, q3 + OUTLIER_K * iqr
-                            print(f"\n>>> Per-Unit {name} Outlier Analysis (sample) <<<")
-                            print(f"  Samples: {arr.size},  Q1={q1:.3e}, Q3={q3:.3e}, IQR={iqr:.3e}")
-                            print(f"  Bounds = [{lower:.3e}, {upper:.3e}]  (cap={SAMPLE_CAP})")
-
-                        _report("u_newton Real", sample_r)
-                        _report("u_newton Imag", sample_i)
-
-                    if b_real is None and b_imag is None:
+                    # If no bounds are available from the sample, skip removal
+                    if (lr is None and ur is None) and (li is None and ui is None):
                         print("No per-unit data available to define outlier bounds; skipping row removal.")
                     else:
-                        lr, ur = b_real if b_real is not None else (-np.inf, np.inf)
-                        li, ui = b_imag if b_imag is not None else (-np.inf, np.inf)
+                        # Default missing channel bounds to ±inf
+                        lr = -np.inf if lr is None else lr
+                        ur = np.inf if ur is None else ur
+                        li = -np.inf if li is None else li
+                        ui = np.inf if ui is None else ui
 
                         # ---- Pass 2: flag rows using min/max early-exit (no large temporaries) ----
-                        mask_row_outlier = np.zeros(len(df), dtype=bool)
+                        rows_before = len(df)
+                        mask_row_outlier = np.zeros(rows_before, dtype=bool)
+
                         for idx, (cell, u_base) in enumerate(zip(df["u_newton"], u_bases)):
                             if not np.isfinite(u_base) or u_base == 0:
                                 continue
@@ -288,7 +285,8 @@ class ChanghunDataset(Dataset):
                         n_bad = int(mask_row_outlier.sum())
                         if n_bad > 0:
                             df = df.loc[~mask_row_outlier].reset_index(drop=True)
-                            print(f"Removed {n_bad} per-unit outlier rows → {df.shape}")
+                            print(f"Removed {n_bad} per-unit outlier rows → {df.shape} "
+                                  f"({100.0 * n_bad / rows_before:.2f}% of rows)")
                         else:
                             print("No rows contained per-unit u_newton outliers; nothing removed.")
 
