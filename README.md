@@ -110,3 +110,8 @@ python bench_inference_fair.py \
 **Notes:** `--cases_per_N` controls samples per size; `--max_nodes_per_forward` caps graph size per forward; `--adaptive_oom_backoff` auto-retries smaller batches on OOM.
 
 ---
+<img width="5502" height="2132" alt="RetHTR" src="https://github.com/user-attachments/assets/7a8b4792-e0b6-44b1-9921-890b0d9959a9" />
+
+<img width="12376" height="6304" alt="RetHTR_training" src="https://github.com/user-attachments/assets/fdc1a8ca-5d57-4709-8717-0e19b3d7e04b" />
+
+<img width="7288" height="4304" alt="RetHTR_inference" src="https://github.com/user-attachments/assets/e2a7ee35-a975-49a6-8ed6-cf47d93a03d3" />
