@@ -109,4 +109,4 @@ python bench_inference_fair.py \
 
 **Notes:** `--cases_per_N` controls samples per size; `--max_nodes_per_forward` caps graph size per forward; `--adaptive_oom_backoff` auto-retries smaller batches on OOM.
 
----
+
