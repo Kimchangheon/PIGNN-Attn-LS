@@ -8,9 +8,8 @@ os.environ.setdefault("MKL_NUM_THREADS", "1")
 os.environ.setdefault("BLIS_NUM_THREADS", "1")
 os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 
-import traceback
 import multiprocessing as mp
-from collections import defaultdict
+from collections import defaultdict, Counter
 
 import numpy as np
 import pandapower.networks as pn
@@ -65,7 +64,7 @@ CASE_KWARGS = {
 }
 
 SCENARIO_PRESETS = {
-    "easy": dict(  # Easy scenario with minimal variability
+    "easy": dict(
         jitter_load=0.02,
         jitter_gen=0.01,
         pv_vset_range=(0.995, 1.005),
@@ -73,7 +72,7 @@ SCENARIO_PRESETS = {
         angle_jitter_deg=0.5,
         mag_jitter_pq=0.002,
     ),
-    "no_change": dict(  # Scenario with no changes at all
+    "no_change": dict(
         jitter_load=0.0,
         jitter_gen=0.0,
         pv_vset_range=(1.0, 1.0),
@@ -81,7 +80,6 @@ SCENARIO_PRESETS = {
         angle_jitter_deg=0.0,
         mag_jitter_pq=0.0,
     ),
-
     "A": dict(
         jitter_load=0.05,
         jitter_gen=0.03,
@@ -109,6 +107,58 @@ SCENARIO_PRESETS = {
 }
 
 
+# ============================================================
+# per-unit conversion helpers for NR
+# ============================================================
+
+def ybus_si_to_pu(Y_si: np.ndarray, Vbase_bus: np.ndarray, S_base: float) -> np.ndarray:
+    """
+    Entrywise Ybus SI -> pu with local bus bases:
+        Y_pu[i,j] = Y_SI[i,j] * V_i * V_j / S_base
+    """
+    scale = np.outer(Vbase_bus, Vbase_bus) / float(S_base)
+    return np.asarray(Y_si, dtype=np.complex128) * scale.astype(np.float64, copy=False)
+
+
+def u_si_to_pu_per_bus(u_si: np.ndarray, Vbase_bus: np.ndarray) -> np.ndarray:
+    """
+    Voltage SI -> pu per bus:
+        U_pu[i] = U_SI[i] / V_i
+    """
+    return np.asarray(u_si, dtype=np.complex128) / np.asarray(Vbase_bus, dtype=np.float64)
+
+
+def s_si_to_pu(S_si: np.ndarray, S_base: float) -> np.ndarray:
+    """
+    Power SI -> pu:
+        S_pu[i] = S_SI[i] / S_base
+    """
+    return np.asarray(S_si, dtype=np.complex128) / float(S_base)
+
+
+def convert_nr_inputs_to_pu(
+    Y_matrix_si: np.ndarray,
+    s_multi_si: np.ndarray,
+    u_start_si: np.ndarray,
+    vn_kv: np.ndarray,
+    S_base: float,
+):
+    """
+    Convert NR inputs from SI to per-unit using per-bus voltage bases.
+    """
+    Vbase_bus = np.asarray(vn_kv, dtype=np.float64) * 1e3
+
+    Y_pu = ybus_si_to_pu(np.asarray(Y_matrix_si, dtype=np.complex128), Vbase_bus, S_base)
+    s_pu = s_si_to_pu(np.asarray(s_multi_si, dtype=np.complex128), S_base)
+    u_pu = u_si_to_pu_per_bus(np.asarray(u_start_si, dtype=np.complex128), Vbase_bus)
+
+    return Y_pu, s_pu, u_pu, Vbase_bus
+
+
+# ============================================================
+# misc helpers
+# ============================================================
+
 def is_converged_solution(u_newton) -> bool:
     a = np.asarray(u_newton)
     if a.size == 0:
@@ -119,13 +169,43 @@ def is_converged_solution(u_newton) -> bool:
 
 
 def _worker_init():
-    # Defensive: keep every worker single-threaded internally
     os.environ["OMP_NUM_THREADS"] = "1"
     os.environ["OPENBLAS_NUM_THREADS"] = "1"
     os.environ["MKL_NUM_THREADS"] = "1"
     os.environ["BLIS_NUM_THREADS"] = "1"
     os.environ["NUMEXPR_NUM_THREADS"] = "1"
 
+
+def _compact_diag(diag: dict):
+    """
+    Keep only compact diagnostic info in results to avoid bloating memory.
+    """
+    if diag is None:
+        return None
+
+    out = {
+        "converged": diag.get("converged"),
+        "classification": diag.get("classification"),
+        "failure_reason": diag.get("failure_reason"),
+        "iterations": diag.get("iterations"),
+        "final_misinf": diag.get("final_misinf"),
+        "best_misinf": diag.get("best_misinf"),
+    }
+
+    if "misinf_history" in diag:
+        hist = diag.get("misinf_history", [])
+        out["misinf_history_tail"] = hist[-5:] if hist else []
+
+    if "step_history" in diag:
+        hist = diag.get("step_history", [])
+        out["step_history_tail"] = hist[-5:] if hist else []
+
+    return out
+
+
+# ============================================================
+# worker
+# ============================================================
 
 def run_one_case_one_seed(task):
     """
@@ -137,6 +217,10 @@ def run_one_case_one_seed(task):
         use_force_shunt_when_no_trafo,
         trafo_pfe_kw,
         trafo_i0_percent,
+        pu_nr,
+        diagnose_nr,
+        print_misinf,
+        near_misinf_tol,
     )
     """
     (
@@ -147,6 +231,10 @@ def run_one_case_one_seed(task):
         use_force_shunt_when_no_trafo,
         trafo_pfe_kw,
         trafo_i0_percent,
+        pu_nr,
+        diagnose_nr,
+        print_misinf,
+        near_misinf_tol,
     ) = task
 
     try:
@@ -206,17 +294,48 @@ def run_one_case_one_seed(task):
                 "gridtype": gridtype,
                 "converged": False,
                 "reason": "generator_returned_not_connected",
+                "nr_diag": None,
             }
 
-        u_newton, _I_unused, S_newton = newtonrapson(
-            np.asarray(bus_typ).copy(),
-            np.asarray(Y_matrix).copy(),
-            np.asarray(s_multi).copy(),
-            np.asarray(u_start).copy(),
+        bus_typ_arr = np.asarray(bus_typ, dtype=np.int64).copy()
+
+        if pu_nr:
+            Y_for_nr, S_for_nr, U_for_nr, _Vbase_bus = convert_nr_inputs_to_pu(
+                Y_matrix_si=np.asarray(Y_matrix, dtype=np.complex128),
+                s_multi_si=np.asarray(s_multi, dtype=np.complex128),
+                u_start_si=np.asarray(u_start, dtype=np.complex128),
+                vn_kv=np.asarray(vn_kv, dtype=np.float64),
+                S_base=float(S_base),
+            )
+        else:
+            Y_for_nr = np.asarray(Y_matrix, dtype=np.complex128).copy()
+            S_for_nr = np.asarray(s_multi, dtype=np.complex128).copy()
+            U_for_nr = np.asarray(u_start, dtype=np.complex128).copy()
+
+        # NOTE:
+        # print_misinf=True with multiprocessing will interleave logs across workers.
+        # Use workers=1 when you want readable per-iteration traces.
+        u_newton, _I_unused, S_newton, nr_diag = newtonrapson(
+            bus_typ_arr,
+            Y_for_nr,
+            S_for_nr,
+            U_for_nr,
             K=K,
+            diagnose=diagnose_nr,
+            print_misinf=print_misinf,
+            return_diagnostics=True,
+            near_misinf_tol=near_misinf_tol,
         )
 
         conv = is_converged_solution(u_newton)
+
+        if conv:
+            reason = "ok"
+        else:
+            if nr_diag is not None and nr_diag.get("classification") is not None:
+                reason = str(nr_diag["classification"])
+            else:
+                reason = "all_zero_solution_or_empty"
 
         return {
             "case": case_name,
@@ -224,7 +343,8 @@ def run_one_case_one_seed(task):
             "N": N,
             "gridtype": gridtype,
             "converged": conv,
-            "reason": "ok" if conv else "all_zero_solution_or_empty",
+            "reason": reason,
+            "nr_diag": _compact_diag(nr_diag),
         }
 
     except Exception as e:
@@ -235,8 +355,13 @@ def run_one_case_one_seed(task):
             "gridtype": None,
             "converged": False,
             "reason": f"NR_exception: {repr(e)}",
+            "nr_diag": None,
         }
 
+
+# ============================================================
+# task building
+# ============================================================
 
 def build_tasks(
     scenarios_per_case=10,
@@ -245,6 +370,10 @@ def build_tasks(
     use_force_shunt_when_no_trafo=True,
     trafo_pfe_kw=50.0,
     trafo_i0_percent=2.0,
+    pu_nr=False,
+    diagnose_nr=True,
+    print_misinf=False,
+    near_misinf_tol=1e-3,
 ):
     if scenario_level not in SCENARIO_PRESETS:
         raise ValueError(f"Unknown scenario_level={scenario_level}. Use one of {list(SCENARIO_PRESETS.keys())}")
@@ -263,9 +392,17 @@ def build_tasks(
                 use_force_shunt_when_no_trafo,
                 trafo_pfe_kw,
                 trafo_i0_percent,
+                pu_nr,
+                diagnose_nr,
+                print_misinf,
+                near_misinf_tol,
             ))
     return tasks
 
+
+# ============================================================
+# summary
+# ============================================================
 
 def summarize_results(results, scenarios_per_case):
     by_case = defaultdict(list)
@@ -275,6 +412,7 @@ def summarize_results(results, scenarios_per_case):
     summary = []
     zero_conv_cases = []
     all_fail_details = {}
+    all_fail_diag_samples = {}
 
     for case_name in CASES:
         rows = by_case.get(case_name, [])
@@ -286,6 +424,8 @@ def summarize_results(results, scenarios_per_case):
         gridtype = None
 
         fail_reasons = []
+        fail_diag_samples = []
+
         for r in rows:
             if N is None and r["N"] is not None:
                 N = r["N"]
@@ -293,6 +433,8 @@ def summarize_results(results, scenarios_per_case):
                 gridtype = r["gridtype"]
             if not r["converged"]:
                 fail_reasons.append(r["reason"])
+                if r.get("nr_diag") is not None:
+                    fail_diag_samples.append(r["nr_diag"])
 
         at_least_once = (n_conv > 0)
 
@@ -303,14 +445,20 @@ def summarize_results(results, scenarios_per_case):
             "converged": n_conv,
             "failed": n_fail,
             "at_least_once": at_least_once,
+            "reason_counts": dict(Counter(fail_reasons)),
         })
 
         if not at_least_once:
             zero_conv_cases.append(case_name)
             all_fail_details[case_name] = fail_reasons
+            all_fail_diag_samples[case_name] = fail_diag_samples
 
-    return summary, zero_conv_cases, all_fail_details
+    return summary, zero_conv_cases, all_fail_details, all_fail_diag_samples
 
+
+# ============================================================
+# main runner
+# ============================================================
 
 def quick_screen_all_cases_mp(
     scenarios_per_case=10,
@@ -321,6 +469,10 @@ def quick_screen_all_cases_mp(
     use_force_shunt_when_no_trafo=True,
     trafo_pfe_kw=None,
     trafo_i0_percent=None,
+    pu_nr=False,
+    diagnose_nr=True,
+    print_misinf=False,
+    near_misinf_tol=1e-3,
 ):
     tasks = build_tasks(
         scenarios_per_case=scenarios_per_case,
@@ -329,12 +481,16 @@ def quick_screen_all_cases_mp(
         use_force_shunt_when_no_trafo=use_force_shunt_when_no_trafo,
         trafo_pfe_kw=trafo_pfe_kw,
         trafo_i0_percent=trafo_i0_percent,
+        pu_nr=pu_nr,
+        diagnose_nr=diagnose_nr,
+        print_misinf=print_misinf,
+        near_misinf_tol=near_misinf_tol,
     )
 
     if workers <= 0:
         workers = os.cpu_count() or 1
 
-    print("=" * 90)
+    print("=" * 100)
     print("Quick NR convergence screening (multiprocessing)")
     print(f"tasks              = {len(tasks)}")
     print(f"cases              = {len(CASES)}")
@@ -344,7 +500,14 @@ def quick_screen_all_cases_mp(
     print(f"K                  = {K}")
     print(f"workers            = {workers}")
     print(f"chunksize          = {chunksize}")
-    print("=" * 90)
+    print(f"pu_nr              = {pu_nr}")
+    print(f"diagnose_nr        = {diagnose_nr}")
+    print(f"print_misinf       = {print_misinf}")
+    print(f"near_misinf_tol    = {near_misinf_tol}")
+    print("=" * 100)
+
+    if print_misinf and workers != 1:
+        print("WARNING: print_misinf=True with workers>1 will produce interleaved logs.\n")
 
     if os.name == "nt":
         ctx = mp.get_context("spawn")
@@ -355,14 +518,28 @@ def quick_screen_all_cases_mp(
     with ctx.Pool(processes=workers, initializer=_worker_init, maxtasksperchild=200) as pool:
         for idx, res in enumerate(pool.imap_unordered(run_one_case_one_seed, tasks, chunksize=chunksize), 1):
             results.append(res)
+
             status = "converged" if res["converged"] else f"failed ({res['reason']})"
-            print(f"[{idx:4d}/{len(tasks)}] {res['case']} seed={res['seed']} -> {status}")
 
-    summary, zero_conv_cases, all_fail_details = summarize_results(results, scenarios_per_case)
+            extra = ""
+            nr_diag = res.get("nr_diag")
+            if nr_diag is not None and not res["converged"]:
+                final_misinf = nr_diag.get("final_misinf")
+                best_misinf = nr_diag.get("best_misinf")
+                iterations = nr_diag.get("iterations")
+                extra = (
+                    f" | it={iterations}"
+                    f" | best_misinf={best_misinf if best_misinf is not None else 'None'}"
+                    f" | final_misinf={final_misinf if final_misinf is not None else 'None'}"
+                )
 
-    print("\n" + "=" * 90)
+            print(f"[{idx:4d}/{len(tasks)}] {res['case']} seed={res['seed']} -> {status}{extra}")
+
+    summary, zero_conv_cases, all_fail_details, all_fail_diag_samples = summarize_results(results, scenarios_per_case)
+
+    print("\n" + "=" * 100)
     print("SUMMARY")
-    print("=" * 90)
+    print("=" * 100)
 
     summary_sorted = sorted(summary, key=lambda x: (x["converged"], x["N"] if x["N"] is not None else 10**9))
     for row in summary_sorted:
@@ -370,7 +547,8 @@ def quick_screen_all_cases_mp(
             f"{row['case']:16s} | "
             f"N={str(row['N']):>5s} | "
             f"conv={row['converged']:2d}/{scenarios_per_case} | "
-            f"at_least_once={row['at_least_once']}"
+            f"at_least_once={row['at_least_once']} | "
+            f"fail_reasons={row['reason_counts']}"
         )
 
     print("\nCases with ZERO convergence in the tested scenarios:")
@@ -389,12 +567,32 @@ def quick_screen_all_cases_mp(
                 if r not in uniq:
                     uniq.append(r)
             print(f"\n[{c}]")
-            for r in uniq[:5]:
+            for r in uniq[:10]:
                 print(f"  {r}")
     else:
         print("  None")
 
-    return results, summary, zero_conv_cases, all_fail_details
+    print("\nDiagnostic samples for zero-convergence cases:")
+    if zero_conv_cases:
+        for c in zero_conv_cases:
+            samples = all_fail_diag_samples[c]
+            print(f"\n[{c}]")
+            if not samples:
+                print("  no nr_diag stored")
+                continue
+            for i, d in enumerate(samples[:3], 1):
+                print(
+                    f"  sample {i}: "
+                    f"class={d.get('classification')} | "
+                    f"it={d.get('iterations')} | "
+                    f"best_misinf={d.get('best_misinf')} | "
+                    f"final_misinf={d.get('final_misinf')} | "
+                    f"misinf_tail={d.get('misinf_history_tail')}"
+                )
+    else:
+        print("  None")
+
+    return results, summary, zero_conv_cases, all_fail_details, all_fail_diag_samples
 
 
 if __name__ == "__main__":
@@ -405,6 +603,10 @@ if __name__ == "__main__":
         workers=0,   # 0 => all CPU cores
         chunksize=1,
         use_force_shunt_when_no_trafo=True,
+        pu_nr=True,          # per-unit NR
+        diagnose_nr=True,    # store and classify non-convergence
+        print_misinf=False,  # set True only when workers=1 for readable logs
+        near_misinf_tol=1e-3,
         # trafo_pfe_kw=50.0,
         # trafo_i0_percent=2.0,
     )
