@@ -301,6 +301,7 @@ def _generate_one_record_serialized() -> Dict[str, Any]:
         'Y_Lines': ndarray_to_npy_bytes(Y_Lines),
         'Y_C_Lines': ndarray_to_npy_bytes(Y_C_Lines),
         'Lines_connected': ndarray_to_npy_bytes(Lines_connected),
+
         'u_start': ndarray_to_npy_bytes(u_start),
         'u_newton': ndarray_to_npy_bytes(u_newton),
         'S_start': ndarray_to_npy_bytes(s_multi),

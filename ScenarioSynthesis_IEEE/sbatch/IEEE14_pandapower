@@ -1,0 +1,17 @@
+python main_datagen_multiproc_improved.py \
+  --preset ieee14_pandapower \
+  --runs 10 \
+  --workers 1 \
+  --rows_per_task 10 \
+  --save_steps 10 \
+  --overwrite \
+  --save_path ./out/ieee14_pp
+
+  python main_datagen_multiproc_improved.py \
+  --preset ieee14_pandapower \
+  --runs 36000 \
+  --workers 8 \
+  --rows_per_task 400 \
+  --save_steps 2000 \
+  --overwrite \
+  --save_path ./out/ieee14_pp

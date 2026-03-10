@@ -47,6 +47,7 @@ parser.add_argument('--model', type=str, default="GNSMsg_EdgeSelfAttn", help='GN
 parser.add_argument("--d", type=int, default=4, help="model input dim")
 parser.add_argument("--d_hi", type=int, default=16, help="model hidden dim")
 parser.add_argument("--num_attn_layers", type=int, default=1, help="model hidden dim")
+parser.add_argument("--n_heads", type=int, default=4, help="model hidden dim")
 
 parser.add_argument("--K", type=int, default=40, help="K")
 parser.add_argument('--gamma', type=float, default=0.9, help='phys_loss decay over K')
@@ -116,6 +117,7 @@ VAL_EVERY  = args.VAL_EVERY
 PARQUET    = args.PARQUET
 d = args.d
 d_hi = args.d_hi
+n_heads = args.n_heads
 K = args.K
 GAMMA = args.gamma
 VLIMIT = args.vlimit
@@ -208,7 +210,7 @@ print(f"Dataset sizes  |  train {n_train}   valid {n_val}   test {n_test}")
 if args.model =="GNSMsg" :
     model = GNSMsg(d=d, d_hi=d_hi, K=K, pinn=PINN, gamma=GAMMA, v_limit=VLIMIT, use_armijo=args.use_armijo).to(device)
 elif args.model =="GNSMsg_EdgeSelfAttn" :
-    model = GNSMsg_EdgeSelfAttn(d=d, d_hi=d_hi, K=K, pinn=PINN, gamma=GAMMA, v_limit=VLIMIT, use_armijo=args.use_armijo, num_attn_layers=args.num_attn_layers).to(device)
+    model = GNSMsg_EdgeSelfAttn(d=d, d_hi=d_hi, n_heads=n_heads, K=K, pinn=PINN, gamma=GAMMA, v_limit=VLIMIT, use_armijo=args.use_armijo, num_attn_layers=args.num_attn_layers).to(device)
 # model = model.double()
 
 def init_weights(model, exclude_modules):
@@ -319,6 +321,7 @@ def run_epoch(loader, *, train: bool, pinn: bool):
                 Vpred, loss_phys = model(bus_type, Line, Y, Ys, Yc, Sstart, Vstart, n_nodes_per_graph)
                 assert isinstance(Vpred, torch.Tensor), "expected tensor from model"
 
+                # these are just for reporting
                 dmag = (Vpred[..., 0] - Vnewton[..., 0])
                 dang = torch.atan2(
                     torch.sin(Vpred[..., 1] - Vnewton[..., 1]),
@@ -326,9 +329,18 @@ def run_epoch(loader, *, train: bool, pinn: bool):
                 )
                 mse_mag = torch.mean(dmag ** 2)
                 mse_ang = torch.mean(dang ** 2)
-                mse = mse_mag + mse_ang
+                mse = mse_mag + mse_ang # reporting only
 
                 loss = loss_phys
+                # ---------- NO-OP GRAD GUARD (pure PINN, no supervised term) ----------
+                if train and not loss.requires_grad:
+                    # Touch one learnable parameter with a 0.0 multiplier:
+                    # makes `loss` require grad but produces zero gradient update.
+                    p0 = next(model.parameters())
+                    loss = loss + 0.0 * p0.norm()
+                    # Optional: warn so you know it happened
+                    print("[warn] physics loss detached for this batch; applied zero-grad guard.")
+
             else:
                 Vpred = model(bus_type, Line, Y, Ys, Yc, Sstart, Vstart, n_nodes_per_graph)
                 assert isinstance(Vpred, torch.Tensor), "expected tensor from model"

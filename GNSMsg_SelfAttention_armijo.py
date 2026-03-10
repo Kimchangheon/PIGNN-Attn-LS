@@ -7,7 +7,6 @@ from torch_scatter import scatter_add, scatter_max
 
 # --------------------------- utils ---------------------------
 
-@torch.no_grad()
 def _segmented_softmax(logits_b_e_h: torch.Tensor, dst_e: torch.Tensor, num_nodes: int) -> torch.Tensor:
     """
     Vectorized softmax over incoming edges per (batch, head, node).
@@ -330,8 +329,7 @@ class GNSMsg_EdgeSelfAttn(nn.Module):
         slack_mask = (bus_type == 1)
         pv_mask = (bus_type == 2)
 
-        if self.pinn:
-            phys_loss = torch.zeros(1, device=device)
+        phys_terms = []  # collect per-iteration physics terms
 
         # ------------------------- K iterations -------------------------
         for k in range(self.K):
@@ -384,31 +382,43 @@ class GNSMsg_EdgeSelfAttn(nn.Module):
             # ---- Armijo line search (optional) ----
             if self.use_armijo:
                 v_min, v_max = 0.75, 1.2
-                F0 = _batched_mismatch_inf_norm(Y, v, th, P_set, Q_set, slack_mask, pv_mask)
+
+                # Decision-only: evaluate current mismatch without autograd.
+                with torch.no_grad():
+                    F0 = _batched_mismatch_inf_norm(Y, v, th, P_set, Q_set, slack_mask, pv_mask)
 
                 alphas = v.new_tensor([1.0, 0.5, 0.25, 0.125, 0.0625])
-                T = alphas.numel()
+                T = int(alphas.numel())
 
+                # Build candidate updates WITH grad tracking.
                 v_try = torch.clamp(v.unsqueeze(0) + alphas.view(T, 1, 1) * dv.unsqueeze(0), v_min, v_max)
                 th_try = (th.unsqueeze(0) + alphas.view(T, 1, 1) * dth.unsqueeze(0) + math.pi) % (2 * math.pi) - math.pi
 
-                F_all = torch.stack([
-                    _batched_mismatch_inf_norm(Y, v_try[t], th_try[t], P_set, Q_set, slack_mask, pv_mask)
-                    for t in range(T)
-                ])
+                # Score candidates WITHOUT grad (decision only).
+                with torch.no_grad():
+                    F_all = torch.stack([
+                        _batched_mismatch_inf_norm(Y, v_try[t], th_try[t], P_set, Q_set, slack_mask, pv_mask)
+                        for t in range(T)
+                    ])
+                    c1 = 1e-4
+                    cond = F_all <= (1.0 - c1 * alphas) * F0
+                    found = bool(cond.any())
 
-                c1 = 1e-4
-                cond = F_all <= (1.0 - c1 * alphas) * F0
-                if cond.any():
+                if found:
+                    # Pick the first alpha that satisfies Armijo condition (keep grads through v_try/th_try).
                     t_sel = int(torch.nonzero(cond, as_tuple=False)[0].item())
                     a = float(alphas[t_sel])
-                    v, th = v_try[t_sel], th_try[t_sel]
-                    m = m + a * dm
+                    v = v_try[t_sel]  # still attached to dv
+                    th = th_try[t_sel]  # still attached to dth
+                    m = m + a * dm  # dm carries grad to parameters
                 else:
+                    # Fallback: try the smallest step; accept only if it reduces mismatch.
                     a = float(alphas[-1])
                     v2 = torch.clamp(v + a * dv, v_min, v_max)
                     th2 = (th + a * dth + math.pi) % (2 * math.pi) - math.pi
-                    if _batched_mismatch_inf_norm(Y, v2, th2, P_set, Q_set, slack_mask, pv_mask) < F0:
+                    with torch.no_grad():
+                        ok = _batched_mismatch_inf_norm(Y, v2, th2, P_set, Q_set, slack_mask, pv_mask) < F0
+                    if ok:
                         v, th, m = v2, th2, m + a * dm
             else:
                 th = (th + dth + math.pi) % (2 * math.pi) - math.pi
@@ -416,7 +426,12 @@ class GNSMsg_EdgeSelfAttn(nn.Module):
                 m = m + dm
 
             if self.pinn:
-                phys_loss = phys_loss + (self.gamma ** (self.K - 1 - k)) * ((DP ** 2 + DQ ** 2).mean())
+                term = (self.gamma ** (self.K - 1 - k)) * ((DP ** 2 + DQ ** 2).mean())
+                phys_terms.append(term)
 
         out = torch.stack([v, th], dim=-1)
-        return (out, phys_loss) if self.pinn else out
+        if self.pinn:
+            phys_loss = torch.sum(torch.stack(phys_terms))
+            return out, phys_loss
+        else :
+            return out
