@@ -1,13 +1,25 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import os
+import glob
 import copy
+import warnings
 import numpy as np
-from typing import Optional, Dict, Callable, Any, Union
+from typing import Optional, Dict, Callable, Any, Union, Sequence
 from pandapower.pypower.makeSbus import makeSbus
 
 # ============================================================
 # Types
 # ============================================================
 
-CaseFn = Union[str, Callable[..., Any]]
+CaseSource = Union[
+    str,                    # pandapower case name OR CGMES zip path OR folder path
+    Callable[..., Any],     # callable returning a pandapower net
+    Any,                    # already-built pandapower net
+    Sequence[str],          # list/tuple of CGMES zip paths
+    Dict[str, Any],         # CGMES config dict
+]
 
 
 # ============================================================
@@ -37,18 +49,11 @@ def _col(row: np.ndarray, idx, default=0.0) -> float:
     return float(row[idx])
 
 
-def _resolve_case_function(case_fn: CaseFn):
-    import pandapower.networks as pn
-
-    if isinstance(case_fn, str):
-        fn = getattr(pn, case_fn, None)
-        if fn is None:
-            raise ValueError(f"Unknown pandapower case function name: {case_fn}")
-        case_name = case_fn
-    else:
-        fn = case_fn
-        case_name = getattr(case_fn, "__name__", "pandapower_case")
-    return fn, case_name
+def _looks_like_pandapower_net(obj) -> bool:
+    """
+    Lightweight duck-typing check for a pandapower net.
+    """
+    return hasattr(obj, "bus") and hasattr(obj, "__getitem__")
 
 
 def _dense_ybus_from_ppc_internal(ppc_int) -> np.ndarray:
@@ -57,6 +62,136 @@ def _dense_ybus_from_ppc_internal(ppc_int) -> np.ndarray:
     if hasattr(Y, "toarray"):
         return Y.toarray().astype(np.complex128)
     return np.asarray(Y, dtype=np.complex128)
+
+
+def _cgmes_from_files(file_list, converter_kwargs: Optional[Dict[str, Any]] = None):
+    """
+    Load CGMES zip files into a pandapower net.
+    Works with both import styles that exist in different pandapower versions.
+    """
+    converter_kwargs = converter_kwargs or {}
+    files = [str(f) for f in file_list]
+
+    for f in files:
+        if not os.path.exists(f):
+            raise FileNotFoundError(f"CGMES file does not exist: {f}")
+
+    warnings.simplefilter(action="ignore", category=FutureWarning)
+
+    from pandapower.converter.cim import from_cim as cim_import
+
+    if hasattr(cim_import, "from_cim"):
+        net = cim_import.from_cim(file_list=files, **converter_kwargs)
+    else:
+        net = cim_import(file_list=files, **converter_kwargs)
+
+    return net
+
+
+def _normalize_cgmes_files_from_path(path_str: str):
+    """
+    Accept either:
+      - a single zip file path
+      - a directory containing *.zip files
+    """
+    path_str = os.path.abspath(os.path.expanduser(str(path_str)))
+
+    if os.path.isfile(path_str):
+        return [path_str]
+
+    if os.path.isdir(path_str):
+        zips = sorted(glob.glob(os.path.join(path_str, "*.zip")))
+        if not zips:
+            raise FileNotFoundError(f"No .zip files found in directory: {path_str}")
+        return zips
+
+    raise FileNotFoundError(f"Path does not exist: {path_str}")
+
+
+def _default_case_name_from_files(files):
+    if len(files) == 1:
+        return os.path.splitext(os.path.basename(files[0]))[0]
+    parent = os.path.basename(os.path.dirname(files[0]))
+    return parent if parent else "cgmes_case"
+
+
+def _build_net_from_source(case_fn: CaseSource, case_kwargs: Optional[Dict[str, Any]] = None):
+    """
+    Generalized source resolver.
+
+    Supported inputs:
+      1) pandapower test case name, e.g. "case14"
+      2) callable returning a net
+      3) already-built pandapower net
+      4) single CGMES zip path
+      5) directory containing CGMES zip files
+      6) list/tuple of CGMES zip files
+      7) dict:
+           {
+             "cgmes_files": [...],              # required
+             "case_name": "my_case",            # optional
+             "converter_kwargs": {...},         # optional
+           }
+    """
+    import pandapower.networks as pn
+
+    case_kwargs = case_kwargs or {}
+
+    # A) already-built pandapower net
+    if _looks_like_pandapower_net(case_fn):
+        net = copy.deepcopy(case_fn)
+        case_name = getattr(net, "name", None) or "pandapower_net"
+        return net, str(case_name)
+
+    # B) CGMES config dict
+    if isinstance(case_fn, dict):
+        if "cgmes_files" not in case_fn:
+            raise ValueError(
+                "If case_fn is a dict, it must contain key 'cgmes_files'."
+            )
+
+        cgmes_files = case_fn["cgmes_files"]
+        if isinstance(cgmes_files, (str, os.PathLike)):
+            files = _normalize_cgmes_files_from_path(str(cgmes_files))
+        else:
+            files = [str(f) for f in cgmes_files]
+
+        converter_kwargs = case_fn.get("converter_kwargs", {})
+        case_name = case_fn.get("case_name", _default_case_name_from_files(files))
+        net = _cgmes_from_files(files, converter_kwargs=converter_kwargs)
+        return net, case_name
+
+    # C) list / tuple of CGMES files
+    if isinstance(case_fn, (list, tuple)):
+        files = [str(f) for f in case_fn]
+        net = _cgmes_from_files(files)
+        case_name = _default_case_name_from_files(files)
+        return net, case_name
+
+    # D) string: either filesystem path or built-in pandapower case name
+    if isinstance(case_fn, str):
+        expanded = os.path.abspath(os.path.expanduser(case_fn))
+        if os.path.exists(expanded):
+            files = _normalize_cgmes_files_from_path(expanded)
+            net = _cgmes_from_files(files)
+            case_name = _default_case_name_from_files(files)
+            return net, case_name
+
+        fn = getattr(pn, case_fn, None)
+        if fn is None:
+            raise ValueError(
+                f"Unknown pandapower case name and not a valid path: {case_fn}"
+            )
+        net = fn(**case_kwargs)
+        return net, case_fn
+
+    # E) callable returning a net
+    if callable(case_fn):
+        net = case_fn(**case_kwargs)
+        case_name = getattr(case_fn, "__name__", "pandapower_case")
+        return net, case_name
+
+    raise TypeError(f"Unsupported case_fn type: {type(case_fn)}")
 
 
 def per_unit_to_SI(Y_pu: np.ndarray, ppc_int) -> np.ndarray:
@@ -178,7 +313,7 @@ def _build_manual_flat_start(
     rng,
 ) -> np.ndarray:
     """
-    Your original manual flat-start logic:
+    Manual flat-start logic:
       - 1.0 pu magnitudes on all buses
       - overwrite PV/slack magnitudes from compiled PPC VG
       - 0 angles, unless rand_u_start=True for non-slack buses
@@ -239,6 +374,11 @@ def _build_dc_compile_start(
 
     ppc_dc = net_dc._ppc["internal"]
 
+    # Some cases / versions do not expose baseMVA in internal after rundcpp,
+    # but bus/gen are usually still available. We do not require baseMVA here.
+    if "bus" not in ppc_dc:
+        raise RuntimeError("ppc internal bus table not available after rundcpp()")
+
     bus_dc = np.asarray(ppc_dc["bus"], dtype=float)
     gen_dc = np.asarray(ppc_dc.get("gen", np.empty((0, 0))), dtype=float)
     if gen_dc.ndim == 1 and gen_dc.size == 0:
@@ -271,7 +411,7 @@ def _build_dc_compile_start(
 # ============================================================
 
 def case_generation_pandapower(
-    case_fn: CaseFn,
+    case_fn: CaseSource,
     case_kwargs: Optional[Dict[str, Any]] = None,
     *,
     ybus_mode: str = "ppcY",   # "ppcY" or "stamped"
@@ -288,15 +428,24 @@ def case_generation_pandapower(
     start_mode: str = "auto",  # "auto", "manual_flat", "ppc_v0", "dc_compile"
 ):
     """
-    Generic pandapower case generator with ONE metadata row per PPC branch row.
+    Generic pandapower/CGMES case generator with ONE metadata row per PPC branch row.
 
     Important:
       - bus_typ is derived from compiled PPC bus types
       - s_multi is derived from compiled PPC bus/gen tables
       - u_start is built in PPC order using the selected start_mode
 
+    case_fn may be:
+      - built-in pandapower case name, e.g. "case14"
+      - callable returning a pandapower net
+      - an already-built pandapower net
+      - a CGMES zip path
+      - a folder containing CGMES zip files
+      - a list/tuple of CGMES zip files
+      - a dict config: {"cgmes_files": [...], "case_name": ..., "converter_kwargs": ...}
+
     start_mode:
-      - "auto"        : current behavior (use ppc_int["V0"] if available, else manual flat)
+      - "auto"        : use ppc_int["V0"] if available, else manual flat
       - "manual_flat" : always use manual flat start
       - "ppc_v0"      : always use ppc_int["V0"]
       - "dc_compile"  : run a DC compile on a copy of the same net and build start
@@ -333,7 +482,6 @@ def case_generation_pandapower(
     )
 
     BR_G, BR_B_ASYM, BR_G_ASYM = _optional_branch_indices()
-    fn, case_name = _resolve_case_function(case_fn)
 
     valid_start_modes = {"auto", "manual_flat", "ppc_v0", "dc_compile"}
     if start_mode not in valid_start_modes:
@@ -343,9 +491,9 @@ def case_generation_pandapower(
     rng = np.random.default_rng(seed)
 
     # ------------------------------------------------------------
-    # 1) Build network
+    # 1) Build network from generalized source
     # ------------------------------------------------------------
-    net = fn(**case_kwargs)
+    net, case_name = _build_net_from_source(case_fn, case_kwargs=case_kwargs)
 
     # optional transformer magnetizing params
     if hasattr(net, "trafo") and net.trafo is not None and len(net.trafo):
@@ -372,10 +520,10 @@ def case_generation_pandapower(
     DISABLE_PV_JITTER_CASES = {"GBnetwork", "GBreducednetwork"}
 
     if (
-            pv_vset_range is not None
-            and case_name not in DISABLE_PV_JITTER_CASES
-            and hasattr(net, "gen")
-            and len(net.gen)
+        pv_vset_range is not None
+        and case_name not in DISABLE_PV_JITTER_CASES
+        and hasattr(net, "gen")
+        and len(net.gen)
     ):
         lo, hi = pv_vset_range
         net.gen["vm_pu"] = rng.uniform(lo, hi, size=len(net.gen))
@@ -417,8 +565,7 @@ def case_generation_pandapower(
     N = bus_ppc.shape[0]
     nl = branch_ppc.shape[0]
 
-    from pandapower.pypower.idx_bus import BASE_KV as _BASE_KV
-    vn_kv = bus_ppc[:, _BASE_KV].astype(float)
+    vn_kv = bus_ppc[:, BASE_KV].astype(float)
     Vbase = vn_kv * 1e3
     S_base = baseMVA * 1e6
 
@@ -636,7 +783,7 @@ def case_generation_pandapower(
 
 
 def case_generation_pandapower_stamped(
-    case_fn: CaseFn,
+    case_fn: CaseSource,
     case_kwargs: Optional[Dict[str, Any]] = None,
     **kwargs,
 ):
@@ -716,7 +863,7 @@ def reconstruct_Y_pandapower_branchrows_direct_SI(
 
 
 # ============================================================
-# Example usage over your CASES list
+# Example usage
 # ============================================================
 
 if __name__ == "__main__":
@@ -767,7 +914,6 @@ if __name__ == "__main__":
     print("=== branch-row direct-SI reconstruction check ===")
 
     for name in CASES:
-        fn = getattr(pn, name)
         case_kwargs = CASE_KWARGS.get(name, {})
 
         force = None
@@ -807,14 +953,14 @@ if __name__ == "__main__":
                 S_base,
                 vn_kv,
             ) = case_generation_pandapower(
-                case_fn=fn,
+                case_fn=name,
                 case_kwargs=case_kwargs,
                 ybus_mode="ppcY",
                 seed=0,
                 trafo_pfe_kw=50.0,
                 trafo_i0_percent=2.0,
                 force_branch_shunt_pu=force,
-                start_mode="auto",  # "auto", "manual_flat", "ppc_v0", "dc_compile"
+                start_mode="auto",
             )
 
             N = len(bus_typ)
@@ -851,3 +997,21 @@ if __name__ == "__main__":
             print(f"{name:16s} | FAILED | {repr(e)}")
 
     print("=== done ===")
+
+    # ------------------------------------------------------------
+    # Example: CGMES usage
+    # ------------------------------------------------------------
+    # cgmes_case = {
+    #     "cgmes_files": [
+    #         "/Users/changhunkim/PycharmProjects/PIGNN-Attn-LS/CGMES_to_PandaPower/IEEE14Bus.zip"
+    #     ],
+    #     "case_name": "IEEE14Bus_CGMES",
+    #     "converter_kwargs": {},
+    # }
+    #
+    # res = case_generation_pandapower(
+    #     case_fn=cgmes_case,
+    #     ybus_mode="ppcY",
+    #     seed=0,
+    #     start_mode="auto",
+    # )
