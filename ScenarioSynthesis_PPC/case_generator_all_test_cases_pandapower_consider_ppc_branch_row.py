@@ -1,6 +1,7 @@
+import copy
 import numpy as np
 from typing import Optional, Dict, Callable, Any, Union
-
+from pandapower.pypower.makeSbus import makeSbus
 
 # ============================================================
 # Types
@@ -166,6 +167,105 @@ def build_Y_stamped_from_ppc(ppc_int):
     return Ybus
 
 
+def _build_manual_flat_start(
+    N: int,
+    bus_typ: np.ndarray,
+    gen_ppc: np.ndarray,
+    Vbase: np.ndarray,
+    rand_u_start: bool,
+    angle_jitter_deg: float,
+    mag_jitter_pq: float,
+    rng,
+) -> np.ndarray:
+    """
+    Your original manual flat-start logic:
+      - 1.0 pu magnitudes on all buses
+      - overwrite PV/slack magnitudes from compiled PPC VG
+      - 0 angles, unless rand_u_start=True for non-slack buses
+    """
+    from pandapower.pypower.idx_gen import GEN_BUS, VG, GEN_STATUS
+
+    mag = Vbase.copy()
+    ang = np.zeros(N, dtype=np.float64)
+
+    if gen_ppc.size > 0 and gen_ppc.shape[1] > max(GEN_BUS, VG, GEN_STATUS):
+        on = gen_ppc[:, GEN_STATUS] > 0
+        gbus = gen_ppc[on, GEN_BUS].astype(int)
+        vg = gen_ppc[on, VG].astype(float)
+        for b, vm in zip(gbus, vg):
+            if 0 <= b < N and np.isfinite(vm) and vm > 0:
+                mag[b] = vm * Vbase[b]
+
+    if rand_u_start:
+        pq_mask = (bus_typ == 3)
+        if pq_mask.any() and mag_jitter_pq > 0:
+            mag[pq_mask] *= rng.uniform(
+                1.0 - mag_jitter_pq,
+                1.0 + mag_jitter_pq,
+                size=int(pq_mask.sum())
+            )
+
+        non_slack = (bus_typ != 1)
+        if non_slack.any() and angle_jitter_deg > 0:
+            ang[non_slack] = rng.uniform(
+                -angle_jitter_deg,
+                angle_jitter_deg,
+                size=int(non_slack.sum())
+            ) * np.pi / 180.0
+
+    return mag * np.exp(1j * ang)
+
+
+def _build_dc_compile_start(
+    net,
+    Vbase: np.ndarray,
+) -> np.ndarray:
+    """
+    Build start voltage from a DC compile on a copy of the same net.
+    Returns SI voltage vector aligned to the internal PPC order.
+
+    This does NOT rely on ppc_int['V0'], because some pandapower versions
+    do not store V0 after rundcpp().
+    """
+    import pandapower as pp
+    from pandapower.pypower.idx_bus import VA
+    from pandapower.pypower.idx_gen import GEN_BUS, VG, GEN_STATUS
+
+    net_dc = copy.deepcopy(net)
+    pp.rundcpp(net_dc)
+
+    if not hasattr(net_dc, "_ppc") or "internal" not in net_dc._ppc:
+        raise RuntimeError("Could not build internal PPC for dc_compile start")
+
+    ppc_dc = net_dc._ppc["internal"]
+
+    bus_dc = np.asarray(ppc_dc["bus"], dtype=float)
+    gen_dc = np.asarray(ppc_dc.get("gen", np.empty((0, 0))), dtype=float)
+    if gen_dc.ndim == 1 and gen_dc.size == 0:
+        gen_dc = gen_dc.reshape(0, 0)
+
+    N = Vbase.shape[0]
+    if bus_dc.shape[0] != N:
+        raise RuntimeError(
+            f"dc_compile bus length mismatch: len(bus_dc)={bus_dc.shape[0]} vs len(Vbase)={N}"
+        )
+
+    # DC angles from bus table (degrees -> radians)
+    ang = np.deg2rad(bus_dc[:, VA].astype(float))
+
+    # Default magnitudes = 1.0 pu, overwrite PV/slack buses from VG where available
+    mag_pu = np.ones(N, dtype=np.float64)
+    if gen_dc.size > 0 and gen_dc.shape[1] > max(GEN_BUS, VG, GEN_STATUS):
+        on = gen_dc[:, GEN_STATUS] > 0
+        gbus = gen_dc[on, GEN_BUS].astype(int)
+        vg = gen_dc[on, VG].astype(float)
+        for b, vm in zip(gbus, vg):
+            if 0 <= b < N and np.isfinite(vm) and vm > 0:
+                mag_pu[b] = vm
+
+    return (mag_pu * np.exp(1j * ang)) * Vbase
+
+
 # ============================================================
 # Generic generator: one metadata row per PPC branch row
 # ============================================================
@@ -184,8 +284,8 @@ def case_generation_pandapower(
     mag_jitter_pq: float = 0.02,
     trafo_pfe_kw: Optional[float] = None,
     trafo_i0_percent: Optional[float] = None,
-    # optional PPC-level forcing (best used when net.trafo is empty)
     force_branch_shunt_pu: Optional[Dict[str, float]] = None,
+    start_mode: str = "auto",  # "auto", "manual_flat", "ppc_v0", "dc_compile"
 ):
     """
     Generic pandapower case generator with ONE metadata row per PPC branch row.
@@ -193,7 +293,14 @@ def case_generation_pandapower(
     Important:
       - bus_typ is derived from compiled PPC bus types
       - s_multi is derived from compiled PPC bus/gen tables
-      - u_start is built in PPC order using compiled PPC gen setpoints
+      - u_start is built in PPC order using the selected start_mode
+
+    start_mode:
+      - "auto"        : current behavior (use ppc_int["V0"] if available, else manual flat)
+      - "manual_flat" : always use manual flat start
+      - "ppc_v0"      : always use ppc_int["V0"]
+      - "dc_compile"  : run a DC compile on a copy of the same net and build start
+                         from DC bus angles + generator VG magnitudes
 
     Returns:
       (
@@ -220,14 +327,17 @@ def case_generation_pandapower(
     """
     import pandapower as pp
     from pandapower.powerflow import LoadflowNotConverged
-    from pandapower.pypower.idx_bus import BASE_KV, GS, BS, BUS_TYPE, PD, QD
-    from pandapower.pypower.idx_gen import GEN_BUS, PG, VG, GEN_STATUS
+    from pandapower.pypower.idx_bus import BASE_KV, GS, BS, BUS_TYPE
     from pandapower.pypower.idx_brch import (
         F_BUS, T_BUS, BR_R, BR_X, BR_B, TAP, SHIFT, BR_STATUS
     )
 
     BR_G, BR_B_ASYM, BR_G_ASYM = _optional_branch_indices()
     fn, case_name = _resolve_case_function(case_fn)
+
+    valid_start_modes = {"auto", "manual_flat", "ppc_v0", "dc_compile"}
+    if start_mode not in valid_start_modes:
+        raise ValueError(f"Unknown start_mode={start_mode!r}. Use one of {sorted(valid_start_modes)}")
 
     case_kwargs = case_kwargs or {}
     rng = np.random.default_rng(seed)
@@ -255,8 +365,18 @@ def case_generation_pandapower(
         s = rng.normal(1.0, jitter_gen, size=len(net.gen))
         net.gen["p_mw"] = net.gen["p_mw"].to_numpy(float) * s
 
-    # optional PV voltage-setpoint jitter (on pandapower gens before compilation)
-    if pv_vset_range is not None and hasattr(net, "gen") and len(net.gen):
+    # optional PV voltage-setpoint jitter
+    # Disable it for GB cases, because they can have multiple voltage-controlling
+    # elements on the same bus and random independent vm_pu values can make the
+    # case internally inconsistent.
+    DISABLE_PV_JITTER_CASES = {"GBnetwork", "GBreducednetwork"}
+
+    if (
+            pv_vset_range is not None
+            and case_name not in DISABLE_PV_JITTER_CASES
+            and hasattr(net, "gen")
+            and len(net.gen)
+    ):
         lo, hi = pv_vset_range
         net.gen["vm_pu"] = rng.uniform(lo, hi, size=len(net.gen))
 
@@ -276,7 +396,6 @@ def case_generation_pandapower(
     except LoadflowNotConverged as e:
         runpp_exception = e
     except Exception as e:
-        # keep the exception around, but still try to use compiled _ppc if available
         runpp_exception = e
 
     if not hasattr(net, "_ppc") or "internal" not in net._ppc:
@@ -298,7 +417,8 @@ def case_generation_pandapower(
     N = bus_ppc.shape[0]
     nl = branch_ppc.shape[0]
 
-    vn_kv = bus_ppc[:, BASE_KV].astype(float)
+    from pandapower.pypower.idx_bus import BASE_KV as _BASE_KV
+    vn_kv = bus_ppc[:, _BASE_KV].astype(float)
     Vbase = vn_kv * 1e3
     S_base = baseMVA * 1e6
 
@@ -357,70 +477,69 @@ def case_generation_pandapower(
 
     # ------------------------------------------------------------
     # 6) bus_typ from compiled PPC bus table
-    #    PYPOWER: 1=PQ, 2=PV, 3=REF
-    #    Your NR : 1=slack, 2=PV, 3=PQ
     # ------------------------------------------------------------
     ppc_bus_type = bus_ppc[:, BUS_TYPE].astype(int)
 
-    bus_typ = np.full(N, 3, dtype=np.int8)  # default PQ in your convention
-    bus_typ[ppc_bus_type == 3] = 1          # REF -> slack
-    bus_typ[ppc_bus_type == 2] = 2          # PV  -> PV
-    bus_typ[ppc_bus_type == 1] = 3          # PQ  -> PQ
+    bus_typ = np.full(N, 3, dtype=np.int8)
+    bus_typ[ppc_bus_type == 3] = 1
+    bus_typ[ppc_bus_type == 2] = 2
+    bus_typ[ppc_bus_type == 1] = 3
 
     # ------------------------------------------------------------
-    # 7) s_multi from compiled PPC bus/gen tables, aligned to Ybus
-    #
-    #    injection convention:
-    #      + generation
-    #      - load
+    # 7) s_multi from compiled PPC bus/gen tables
     # ------------------------------------------------------------
-    s_multi = -(bus_ppc[:, PD] + 1j * bus_ppc[:, QD]) * 1e6
+    try:
+        Sbus_pu = makeSbus(baseMVA, bus_ppc, gen_ppc)
+        s_multi = np.asarray(Sbus_pu).reshape(-1).astype(np.complex128) * S_base
+    except Exception:
+        from pandapower.pypower.idx_bus import PD, QD
+        from pandapower.pypower.idx_gen import GEN_BUS, PG, GEN_STATUS
 
-    if gen_ppc.size > 0 and gen_ppc.shape[1] > max(GEN_BUS, PG, GEN_STATUS):
-        on = gen_ppc[:, GEN_STATUS] > 0
-        gbus = gen_ppc[on, GEN_BUS].astype(int)
-        pg = gen_ppc[on, PG].astype(float) * 1e6
-        np.add.at(s_multi, gbus, pg)
+        s_multi = -(bus_ppc[:, PD] + 1j * bus_ppc[:, QD]) * 1e6
+
+        if gen_ppc.size > 0 and gen_ppc.shape[1] > max(GEN_BUS, PG, GEN_STATUS):
+            on = gen_ppc[:, GEN_STATUS] > 0
+            gbus = gen_ppc[on, GEN_BUS].astype(int)
+            pg = gen_ppc[on, PG].astype(float) * 1e6
+            np.add.at(s_multi, gbus, pg)
 
     # ------------------------------------------------------------
-    # 8) u_start in PPC order
-    #
-    #    Base start:
-    #      - flat angles
-    #      - magnitude = 1.0 pu * local Vbase
-    #      - overwrite PV/slack magnitudes using compiled PPC VG
+    # 8) u_start in PPC order with start_mode
     # ------------------------------------------------------------
-    mag = Vbase.copy()
-    ang = np.zeros(N, dtype=np.float64)
-
-    if gen_ppc.size > 0 and gen_ppc.shape[1] > max(GEN_BUS, VG, GEN_STATUS):
-        on = gen_ppc[:, GEN_STATUS] > 0
-        gbus = gen_ppc[on, GEN_BUS].astype(int)
-        vg = gen_ppc[on, VG].astype(float)
-        for b, vm in zip(gbus, vg):
-            if 0 <= b < N and np.isfinite(vm) and vm > 0:
-                mag[b] = vm * Vbase[b]
-
-    if rand_u_start:
-        # jitter PQ magnitudes only
-        pq_mask = (bus_typ == 3)
-        if pq_mask.any() and mag_jitter_pq > 0:
-            mag[pq_mask] *= rng.uniform(
-                1.0 - mag_jitter_pq,
-                1.0 + mag_jitter_pq,
-                size=int(pq_mask.sum())
+    if start_mode == "auto":
+        if "V0" in ppc_int:
+            u_start = np.asarray(ppc_int["V0"], dtype=np.complex128) * Vbase
+        else:
+            u_start = _build_manual_flat_start(
+                N=N,
+                bus_typ=bus_typ,
+                gen_ppc=gen_ppc,
+                Vbase=Vbase,
+                rand_u_start=rand_u_start,
+                angle_jitter_deg=angle_jitter_deg,
+                mag_jitter_pq=mag_jitter_pq,
+                rng=rng,
             )
 
-        # jitter non-slack angles only
-        non_slack = (bus_typ != 1)
-        if non_slack.any() and angle_jitter_deg > 0:
-            ang[non_slack] = rng.uniform(
-                -angle_jitter_deg,
-                angle_jitter_deg,
-                size=int(non_slack.sum())
-            ) * np.pi / 180.0
+    elif start_mode == "manual_flat":
+        u_start = _build_manual_flat_start(
+            N=N,
+            bus_typ=bus_typ,
+            gen_ppc=gen_ppc,
+            Vbase=Vbase,
+            rand_u_start=rand_u_start,
+            angle_jitter_deg=angle_jitter_deg,
+            mag_jitter_pq=mag_jitter_pq,
+            rng=rng,
+        )
 
-    u_start = mag * np.exp(1j * ang)
+    elif start_mode == "ppc_v0":
+        if "V0" not in ppc_int:
+            raise RuntimeError("start_mode='ppc_v0' requested but ppc_int['V0'] is not available")
+        u_start = np.asarray(ppc_int["V0"], dtype=np.complex128) * Vbase
+
+    elif start_mode == "dc_compile":
+        u_start = _build_dc_compile_start(net=net, Vbase=Vbase)
 
     # ------------------------------------------------------------
     # 9) One metadata row per PPC branch row
@@ -443,7 +562,6 @@ def case_generation_pandapower(
     Branch_hv_is_f = np.zeros(nl, dtype=np.int8)
     Branch_n = np.ones(nl, dtype=np.float64)
 
-    # informational line-only fields
     Y_Lines = np.zeros(nl, dtype=np.complex128)
     Y_C_Lines = np.zeros(nl, dtype=np.float64)
 
@@ -482,27 +600,21 @@ def case_generation_pandapower(
         z = complex(r, x)
         Ys_pu = 0j if (stat == 0.0 or abs(z) < 1e-12) else (stat / z)
 
-        # direct-SI series views
         Branch_y_series_from[k] = Ys_pu * (S_base / (Vf ** 2))
         Branch_y_series_to[k] = Ys_pu * (S_base / (Vt ** 2))
         Branch_y_series_ft[k] = Ys_pu * (S_base / (Vf * Vt))
 
-        # direct-SI end shunts
         Bcf_pu = (g + 1j * b)
         Bct_pu = ((g + g_asym) + 1j * (b + b_asym))
         Branch_y_shunt_from[k] = Bcf_pu * (S_base / (Vf ** 2))
         Branch_y_shunt_to[k] = Bct_pu * (S_base / (Vt ** 2))
 
-        # informational line-only fields
         if not is_tr:
             Y_Lines[k] = Branch_y_series_ft[k]
             Y_C_Lines[k] = 0.5 * b * (S_base / (Vf ** 2))
 
     is_connected = bool(N > 0)
-
-    # kept only for backward compatibility with your old interface
     U_base = float(Vbase[0])
-
     gridtype = f"{case_name}_pandapower_{'ppcY' if ybus_mode.lower() == 'ppcy' else 'stamped'}"
 
     return (
@@ -641,7 +753,6 @@ if __name__ == "__main__":
         "iceland",
     ]
 
-    # cases where net.trafo is empty, so forced PPC branch shunt is useful
     FORCE_SHUNT_CASES = {
         "case4gs", "case5", "case6ww", "case9", "case30", "case33bw"
     }
@@ -703,6 +814,7 @@ if __name__ == "__main__":
                 trafo_pfe_kw=50.0,
                 trafo_i0_percent=2.0,
                 force_branch_shunt_pu=force,
+                start_mode="auto",  # "auto", "manual_flat", "ppc_v0", "dc_compile"
             )
 
             N = len(bus_typ)

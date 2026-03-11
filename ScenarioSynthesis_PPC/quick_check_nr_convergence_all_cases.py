@@ -19,34 +19,34 @@ from newton_raphson_improved import newtonrapson
 
 
 CASES = [
-    # "case4gs",
-    # "case5",
-    # "case6ww",
-    # "case9",
-    # "case14",
-    # "case24_ieee_rts",
-    # "case30",
-    # "case_ieee30",
-    # "case33bw",
-    # "case39",
-    # "case57",
-    # "case89pegase",
-    # "case118",
-    # "case145",
-    # "case_illinois200",
-    # "case300",
-    # "case1354pegase",
+    "case4gs",
+    "case5",
+    "case6ww",
+    "case9",
+    "case14",
+    "case24_ieee_rts",
+    "case30",
+    "case_ieee30",
+    "case33bw",
+    "case39",
+    "case57",
+    "case89pegase",
+    "case118",
+    "case145",
+    "case_illinois200",
+    "case300",
+    "case1354pegase",
     "case1888rte",
-    # "case2848rte",
-    # "case2869pegase",
-    # "case3120sp",
+    "case2848rte",
+    "case2869pegase",
+    "case3120sp",
     "case6470rte",
     "case6495rte",
     "case6515rte",
-    # "case9241pegase",
-    # "GBnetwork",
-    # "GBreducednetwork",
-    # "iceland",
+    "case9241pegase",
+    "GBnetwork",
+    "GBreducednetwork",
+    "iceland",
 ]
 
 # Use only for cases without net.trafo, if you want a nonzero compiled branch shunt
@@ -221,6 +221,7 @@ def run_one_case_one_seed(task):
         diagnose_nr,
         print_misinf,
         near_misinf_tol,
+        start_mode,
     )
     """
     (
@@ -235,6 +236,7 @@ def run_one_case_one_seed(task):
         diagnose_nr,
         print_misinf,
         near_misinf_tol,
+        start_mode,
     ) = task
 
     try:
@@ -253,6 +255,7 @@ def run_one_case_one_seed(task):
             trafo_pfe_kw=trafo_pfe_kw,
             trafo_i0_percent=trafo_i0_percent,
             force_branch_shunt_pu=force,
+            start_mode=start_mode,
         )
         gen_kwargs.update(scenario_cfg)
 
@@ -374,6 +377,7 @@ def build_tasks(
     diagnose_nr=True,
     print_misinf=False,
     near_misinf_tol=1e-3,
+    start_mode="auto",
 ):
     if scenario_level not in SCENARIO_PRESETS:
         raise ValueError(f"Unknown scenario_level={scenario_level}. Use one of {list(SCENARIO_PRESETS.keys())}")
@@ -396,6 +400,7 @@ def build_tasks(
                 diagnose_nr,
                 print_misinf,
                 near_misinf_tol,
+                start_mode,
             ))
     return tasks
 
@@ -473,6 +478,7 @@ def quick_screen_all_cases_mp(
     diagnose_nr=True,
     print_misinf=False,
     near_misinf_tol=1e-3,
+    start_mode="auto",
 ):
     tasks = build_tasks(
         scenarios_per_case=scenarios_per_case,
@@ -485,6 +491,7 @@ def quick_screen_all_cases_mp(
         diagnose_nr=diagnose_nr,
         print_misinf=print_misinf,
         near_misinf_tol=near_misinf_tol,
+        start_mode=start_mode,
     )
 
     if workers <= 0:
@@ -504,6 +511,7 @@ def quick_screen_all_cases_mp(
     print(f"diagnose_nr        = {diagnose_nr}")
     print(f"print_misinf       = {print_misinf}")
     print(f"near_misinf_tol    = {near_misinf_tol}")
+    print(f"start_mode         = {start_mode}")
     print("=" * 100)
 
     if print_misinf and workers != 1:
@@ -597,8 +605,8 @@ def quick_screen_all_cases_mp(
 
 if __name__ == "__main__":
     quick_screen_all_cases_mp(
-        scenarios_per_case=3,
-        scenario_level="no_change",
+        scenarios_per_case=1,
+        scenario_level="A", # no_change, easy, A, B, C
         K=40,
         workers=0,   # 0 => all CPU cores
         chunksize=1,
@@ -607,6 +615,7 @@ if __name__ == "__main__":
         diagnose_nr=True,    # store and classify non-convergence
         print_misinf=False,  # set True only when workers=1 for readable logs
         near_misinf_tol=1e-3,
+        start_mode="dc_compile",   # "auto", "manual_flat", "ppc_v0", "dc_compile"
         # trafo_pfe_kw=50.0,
         # trafo_i0_percent=2.0,
     )

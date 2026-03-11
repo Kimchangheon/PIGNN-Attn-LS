@@ -192,6 +192,14 @@ def JacobianMatrix3p(Y_admittance, U):
     return J, J1, J2, J3, J4
 
 
+def _scaled_mismatch_tol(S_spec, mismatch_tol, min_power_scale=1.0):
+    power_scale = max(
+        min_power_scale,
+        float(np.max(np.abs(S_spec))) if S_spec.size else 0.0,
+    )
+    return float(mismatch_tol * power_scale), power_scale
+
+
 def newtonrapson(
     bus_typ,
     Y_system,
@@ -202,11 +210,14 @@ def newtonrapson(
     print_misinf=False,
     return_diagnostics=False,
     near_misinf_tol=1e-3,
+    convergence_mode="misinf",
+    step_tol=5e-4,
+    mismatch_tol=1e-8,
 ):
     """
     Newton-Raphson without assuming slack bus = index 0.
 
-    New optional arguments:
+    Optional arguments:
       diagnose:
           store mismatch/step histories and classify failed runs
       print_misinf:
@@ -216,12 +227,25 @@ def newtonrapson(
       near_misinf_tol:
           threshold used for the
           'near_convergence_not_passing_step' classification
+      convergence_mode:
+          "two_step" -> original two-step voltage-change criterion
+          "misinf"   -> mismatch-infinity-norm criterion
+      step_tol:
+          threshold for the two-step voltage-change criterion
+      mismatch_tol:
+          threshold for the mismatch-infinity-norm criterion
 
     Default behavior remains the same:
-      - no extra tracing
+      - default convergence is still the original two-step criterion
       - failed runs are still zeroed
       - return is still (u_final, I, S) unless return_diagnostics=True
     """
+    if convergence_mode not in ("two_step", "misinf"):
+        raise ValueError(
+            f"Unknown convergence_mode={convergence_mode!r}. "
+            "Use 'two_step' or 'misinf'."
+        )
+
     diag = {
         "converged": False,
         "classification": None,
@@ -239,13 +263,17 @@ def newtonrapson(
         S_spec = np.asarray(s_L, dtype=np.complex128)
         U = np.asarray(U, dtype=np.complex128).copy()
 
+        effective_mismatch_tol, power_scale = _scaled_mismatch_tol(
+            S_spec=S_spec,
+            mismatch_tol=mismatch_tol,
+        )
+
         P = S_spec.real
         Q = S_spec.imag
 
         N, _ = Y_system.shape
         print(f"{N}- Bus", end="", flush=True)
 
-        tol = 5e-4
         prev2 = None
         prev1 = None
         converged = False
@@ -276,13 +304,25 @@ def newtonrapson(
             if print_misinf:
                 print(f"[misinf={misinf:.3e}]", end="", flush=True)
 
-            if prev2 is not None and prev1 is not None:
-                if (np.max(np.abs(Us - prev1)) < tol) and (np.max(np.abs(prev1 - prev2)) < tol):
-                    print("|converged successfully|")
+            if convergence_mode == "misinf":
+                if misinf < effective_mismatch_tol:
+                    print("|converged successfully (misinf)|")
                     U = Us
                     converged = True
                     failure_reason = None
                     break
+
+            elif convergence_mode == "two_step":
+                if prev2 is not None and prev1 is not None:
+                    if (
+                        np.max(np.abs(Us - prev1)) < step_tol
+                        and np.max(np.abs(prev1 - prev2)) < step_tol
+                    ):
+                        print("|converged successfully|")
+                        U = Us
+                        converged = True
+                        failure_reason = None
+                        break
 
             prev2 = prev1
             prev1 = Us
@@ -305,6 +345,8 @@ def newtonrapson(
             diag["step_history"] = step_hist
             diag["final_misinf"] = misinf_hist[-1] if len(misinf_hist) else None
             diag["best_misinf"] = float(np.min(misinf_hist)) if len(misinf_hist) else None
+            diag["power_scale"] = power_scale
+            diag["effective_mismatch_tol"] = effective_mismatch_tol
 
             if converged:
                 diag["classification"] = "converged"
