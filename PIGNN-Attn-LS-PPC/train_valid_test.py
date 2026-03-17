@@ -3,6 +3,7 @@ import sys
 import time
 import math
 import argparse
+import atexit
 import numpy as np
 
 import torch
@@ -66,6 +67,10 @@ parser.add_argument("--VAL_EVERY", type=int, default=1)
 parser.add_argument("--PARQUET", type=str, nargs='+', required=True, help="Path to parquet data file(s)")
 parser.add_argument("--seed_value", type=int, default=42)
 
+# NEW
+parser.add_argument("--log_to_file", action="store_true", help="Save terminal output to a log file as well")
+parser.add_argument("--log_dir", type=str, default="./results", help="Directory for log file")
+
 args = parser.parse_args()
 
 
@@ -101,27 +106,62 @@ np.random.seed(SEED)
 # ------------------------------------------------------------------
 # Logging
 # ------------------------------------------------------------------
-class Logger:
-    def __init__(self, filename="output.txt"):
-        self.terminal = sys.stdout
-        self.log = open(filename, "w")
+class TeeLogger:
+    def __init__(self, filename, stream):
+        self.stream = stream
+        self.log = open(filename, "a", buffering=1)  # line-buffered
 
     def write(self, message):
-        self.terminal.write(message)
+        self.stream.write(message)
         self.log.write(message)
-        self.log.flush()
 
     def flush(self):
-        pass
+        self.stream.flush()
+        self.log.flush()
+
+    def close(self):
+        try:
+            self.log.close()
+        except Exception:
+            pass
 
 
 parquet_filenames = [os.path.splitext(os.path.basename(p))[0] for p in args.PARQUET]
 shortened_names = ['_'.join(name.split('_')[:3]) for name in parquet_filenames]
 parquet_filename = '_and_'.join(shortened_names)
 
-RUNNAME = f"{parquet_filename}_K{args.K}_d{args.d}_dhi{args.d_hi}_ep{args.EPOCHS}_TrainRatio{args.train_ratio}"
-log_filename = f"./results/{RUNNAME}_training_log.txt"
-sys.stdout = Logger(log_filename)
+armijo_tag = "True" if args.use_armijo else "False"
+
+
+RUNNAME = f"{parquet_filename}_K{args.K}_d{args.d}_dhi{args.d_hi}_numattn{args.num_attn_layers}_armijo{armijo_tag}_ep{args.EPOCHS}_TrainRatio{args.train_ratio}"
+if args.log_to_file:
+    os.makedirs(args.log_dir, exist_ok=True)
+    log_filename = os.path.join(args.log_dir, f"{RUNNAME}_training_log.txt")
+
+    original_stdout = sys.stdout
+    original_stderr = sys.stderr
+
+    sys.stdout = TeeLogger(log_filename, original_stdout)
+    sys.stderr = TeeLogger(log_filename, original_stderr)
+
+    def _cleanup_logger():
+        try:
+            sys.stdout.flush()
+            sys.stderr.flush()
+        except Exception:
+            pass
+        try:
+            sys.stdout.close()
+        except Exception:
+            pass
+        try:
+            sys.stderr.close()
+        except Exception:
+            pass
+
+    atexit.register(_cleanup_logger)
+
+    print(f"[logging] stdout/stderr will also be saved to: {log_filename}")
 
 print(
     f"MODEL:{MODEL}, PINN:{PINN}, Block:{BLOCK_DIAG}, d:{d}, d_hi:{d_hi}, "
@@ -222,9 +262,6 @@ print(f"Dataset sizes | train {n_train}   valid {n_val}   test {n_test}")
 # ------------------------------------------------------------------
 # Model / optimizer / loss
 # ------------------------------------------------------------------
-# ------------------------------------------------------------------
-# 3.  Model / Optim / Loss
-# ------------------------------------------------------------------
 if args.model == "GNSMsg":
     model = GNSMsg(
         d=d,
@@ -275,7 +312,6 @@ def init_weights(model, exclude_modules):
                 elif 'bias' in name:
                     param.data.fill_(args.bias_init)
 
-
 exclude_modules = []
 init_weights(model, exclude_modules)
 
@@ -308,14 +344,12 @@ def run_epoch(loader, *, train: bool, pinn: bool):
 
     with torch.set_grad_enabled(train):
         for batch in loader:
-            # effective graph count for weighting
             if BLOCK_DIAG and "sizes" in batch:
                 B_eff = int(batch["sizes"].numel())
             else:
                 B_eff = int(batch["bus_type"].size(0))
             n_graphs_total += B_eff
 
-            # ----- move to device -----
             if BLOCK_DIAG:
                 n_nodes_per_graph = batch["sizes"].to(device)
             else:
@@ -346,7 +380,6 @@ def run_epoch(loader, *, train: bool, pinn: bool):
             Vstart = batch["V_start"].to(device)
             Vnewton = batch["V_newton"].to(device)
 
-            # ----- forward -----
             if pinn:
                 Vpred, loss_phys = model(
                     bus_type,
@@ -401,7 +434,6 @@ def run_epoch(loader, *, train: bool, pinn: bool):
                 mse = mse_mag + mse_ang
                 loss = mse
 
-            # ----- backward / step -----
             if train:
                 optim.zero_grad()
                 loss.backward()
@@ -410,7 +442,6 @@ def run_epoch(loader, *, train: bool, pinn: bool):
                 if scheduler is not None:
                     scheduler.step()
 
-            # ----- aggregate -----
             sum_loss += loss.item() * B_eff
             sum_mse += mse.item() * B_eff
             sum_mse_mag += mse_mag.item() * B_eff
@@ -500,7 +531,6 @@ if "train" in args.mode:
                 f"time {time.time() - t0:.2f}s"
             )
 
-    # plots
     import matplotlib.pyplot as plt
 
     epochs = range(1, len(train_loss_hist) + 1)
