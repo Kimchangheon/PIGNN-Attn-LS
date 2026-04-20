@@ -1015,3 +1015,12 @@ if __name__ == "__main__":
     #     seed=0,
     #     start_mode="auto",
     # )
+
+    # net = cim2pp.from_cim(file_list=cgmes_files)
+    #
+    # res = case_generation_pandapower(
+    #     case_fn=net,
+    #     ybus_mode="ppcY",
+    #     seed=0,
+    #     start_mode="auto",
+    # )

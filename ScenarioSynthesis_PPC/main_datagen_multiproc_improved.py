@@ -64,9 +64,59 @@ CASES = [
     "iceland",
 ]
 
-# From your scan: these do not have net.trafo rows, so pfe_kw / i0_percent do nothing.
 FORCE_SHUNT_CASES = {
     "case4gs", "case5", "case6ww", "case9", "case30", "case33bw"
+}
+
+CASE_KWARGS = {
+    # "case1888rte": {"ref_bus_idx": 1246},
+    # "case2848rte": {"ref_bus_idx": 271},
+    # "case6470rte": {"ref_bus_idx": 5988},
+    # "case6495rte": {"ref_bus_idx": None},
+    # "case6515rte": {"ref_bus_idx": 6171},
+}
+
+SCENARIO_PRESETS = {
+    "easy": dict(
+        jitter_load=0.02,
+        jitter_gen=0.01,
+        pv_vset_range=(0.995, 1.005),
+        rand_u_start=False,
+        angle_jitter_deg=0.5,
+        mag_jitter_pq=0.002,
+    ),
+    "no_change": dict(
+        jitter_load=0.0,
+        jitter_gen=0.0,
+        pv_vset_range=(1.0, 1.0),
+        rand_u_start=False,
+        angle_jitter_deg=0.0,
+        mag_jitter_pq=0.0,
+    ),
+    "A": dict(
+        jitter_load=0.05,
+        jitter_gen=0.03,
+        pv_vset_range=(0.99, 1.02),
+        rand_u_start=True,
+        angle_jitter_deg=3.0,
+        mag_jitter_pq=0.01,
+    ),
+    "B": dict(
+        jitter_load=0.10,
+        jitter_gen=0.05,
+        pv_vset_range=(0.98, 1.03),
+        rand_u_start=True,
+        angle_jitter_deg=5.0,
+        mag_jitter_pq=0.02,
+    ),
+    "C": dict(
+        jitter_load=0.15,
+        jitter_gen=0.08,
+        pv_vset_range=(0.97, 1.04),
+        rand_u_start=True,
+        angle_jitter_deg=7.0,
+        mag_jitter_pq=0.03,
+    ),
 }
 
 
@@ -82,20 +132,52 @@ def ndarray_to_npy_bytes(x: Any) -> bytes:
     return buf.getvalue()
 
 
-def npy_bytes_to_ndarray(b: bytes) -> np.ndarray:
-    return np.load(io.BytesIO(b), allow_pickle=False)
+# ============================================================
+# PU/SI conversion helpers for NR
+# ============================================================
+
+def ybus_si_to_pu(Y_si: np.ndarray, Vbase_bus: np.ndarray, S_base: float) -> np.ndarray:
+    scale = np.outer(Vbase_bus, Vbase_bus) / float(S_base)
+    return np.asarray(Y_si, dtype=np.complex128) * scale.astype(np.float64, copy=False)
+
+
+def u_si_to_pu_per_bus(u_si: np.ndarray, Vbase_bus: np.ndarray) -> np.ndarray:
+    return np.asarray(u_si, dtype=np.complex128) / np.asarray(Vbase_bus, dtype=np.float64)
+
+
+def s_si_to_pu(S_si: np.ndarray, S_base: float) -> np.ndarray:
+    return np.asarray(S_si, dtype=np.complex128) / float(S_base)
+
+
+def u_pu_to_si_per_bus(u_pu: np.ndarray, Vbase_bus: np.ndarray) -> np.ndarray:
+    return np.asarray(u_pu, dtype=np.complex128) * np.asarray(Vbase_bus, dtype=np.float64)
+
+
+def s_pu_to_si(S_pu: np.ndarray, S_base: float) -> np.ndarray:
+    return np.asarray(S_pu, dtype=np.complex128) * float(S_base)
+
+
+def convert_nr_inputs_to_pu(
+    Y_matrix_si: np.ndarray,
+    s_multi_si: np.ndarray,
+    u_start_si: np.ndarray,
+    vn_kv: np.ndarray,
+    S_base: float,
+):
+    Vbase_bus = np.asarray(vn_kv, dtype=np.float64) * 1e3
+
+    Y_pu = ybus_si_to_pu(np.asarray(Y_matrix_si, dtype=np.complex128), Vbase_bus, S_base)
+    s_pu = s_si_to_pu(np.asarray(s_multi_si, dtype=np.complex128), S_base)
+    u_pu = u_si_to_pu_per_bus(np.asarray(u_start_si, dtype=np.complex128), Vbase_bus)
+
+    return Y_pu, s_pu, u_pu, Vbase_bus
 
 
 # ============================================================
-# Parquet writer for branch-row metadata
+# Parquet writer
 # ============================================================
 
 class ParquetAppendWriter:
-    """
-    Branch-row schema:
-      - one metadata row per PPC branch row (stored as arrays per sample)
-      - no upper-triangular compression anymore
-    """
     def __init__(
         self,
         path: str,
@@ -120,12 +202,10 @@ class ParquetAppendWriter:
             pa.field("U_base", pa.float64()),
             pa.field("S_base", pa.float64()),
 
-            # per-bus arrays
             pa.field("bus_typ", pa.binary()),
             pa.field("vn_kv", pa.binary()),
             pa.field("Y_shunt_bus", pa.binary()),
 
-            # branch-row arrays (length = nl)
             pa.field("Branch_f_bus", pa.binary()),
             pa.field("Branch_t_bus", pa.binary()),
             pa.field("Branch_status", pa.binary()),
@@ -140,7 +220,6 @@ class ParquetAppendWriter:
             pa.field("Branch_hv_is_f", pa.binary()),
             pa.field("Branch_n", pa.binary()),
 
-            # informational line-only arrays (also length = nl)
             pa.field("Y_Lines", pa.binary()),
             pa.field("Y_C_Lines", pa.binary()),
         ]
@@ -213,23 +292,17 @@ def _init_worker(cfg: dict, seed_base: int):
 
 
 def _build_force_branch_shunt_from_cfg(preset: str, cfg: Dict[str, Any]) -> Optional[Dict[str, float]]:
-    """
-    Builds force_branch_shunt_pu dict only if requested.
-    Recommended usage: only for cases with no net.trafo rows.
-    """
-    auto_force_if_no_trafo_case = bool(cfg.get("auto_force_if_no_trafo_case", False))
+    use_force_shunt_when_no_trafo = bool(cfg.get("use_force_shunt_when_no_trafo", False))
     g = float(cfg.get("force_branch_shunt_g_pu", 0.0))
     b = float(cfg.get("force_branch_shunt_b_pu", 0.0))
     g_asym = float(cfg.get("force_branch_shunt_g_asym_pu", 0.0))
     b_asym = float(cfg.get("force_branch_shunt_b_asym_pu", 0.0))
 
     anything_nonzero = any(abs(x) > 0 for x in [g, b, g_asym, b_asym])
-
     if anything_nonzero:
         return {"g": g, "b": b, "g_asym": g_asym, "b_asym": b_asym}
 
-    if auto_force_if_no_trafo_case and preset in FORCE_SHUNT_CASES:
-        # sensible default for “magnetizing-like” perturbation
+    if use_force_shunt_when_no_trafo and preset in FORCE_SHUNT_CASES:
         return {"g": 0.0, "b": 0.2, "g_asym": 0.0, "b_asym": 0.0}
 
     return None
@@ -242,6 +315,8 @@ def _generate_one_record_serialized() -> Dict[str, Any]:
     preset = str(_CFG["preset"]).strip()
     ybus_mode = str(_CFG["ybus_mode"]).strip()
     save_y_matrix = bool(_CFG["save_y_matrix"])
+    pu_nr = bool(_CFG["pu_nr"])
+    start_mode = str(_CFG["start_mode"]).strip()
 
     if not preset:
         raise ValueError("This adapted script expects a pandapower preset in --preset.")
@@ -251,40 +326,28 @@ def _generate_one_record_serialized() -> Dict[str, Any]:
         raise ValueError(f"Unknown pandapower case preset: {preset}")
 
     force_branch_shunt_pu = _build_force_branch_shunt_from_cfg(preset, _CFG)
-
     sample_seed = int(_RNG.integers(0, 2**32 - 1, dtype=np.uint32))
 
+    gen_kwargs = dict(
+        case_fn=case_fn,
+        case_kwargs=CASE_KWARGS.get(preset, {}).copy(),
+        seed=sample_seed,
+        jitter_load=float(_CFG["jitter_load"]),
+        jitter_gen=float(_CFG["jitter_gen"]),
+        pv_vset_range=_CFG["pv_vset_range"],
+        rand_u_start=bool(_CFG["rand_u_start"]),
+        angle_jitter_deg=float(_CFG["angle_jitter_deg"]),
+        mag_jitter_pq=float(_CFG["mag_jitter_pq"]),
+        trafo_pfe_kw=_CFG["trafo_pfe_kw"],
+        trafo_i0_percent=_CFG["trafo_i0_percent"],
+        force_branch_shunt_pu=force_branch_shunt_pu,
+        start_mode=start_mode,
+    )
+
     if ybus_mode.lower() == "stamped":
-        out = case_generation_pandapower_stamped(
-            case_fn=case_fn,
-            case_kwargs={},
-            seed=sample_seed,
-            jitter_load=float(_CFG["jitter_load"]),
-            jitter_gen=float(_CFG["jitter_gen"]),
-            pv_vset_range=_CFG["pv_vset_range"],
-            rand_u_start=bool(_CFG["rand_u_start"]),
-            angle_jitter_deg=float(_CFG["angle_jitter_deg"]),
-            mag_jitter_pq=float(_CFG["mag_jitter_pq"]),
-            trafo_pfe_kw=_CFG["trafo_pfe_kw"],
-            trafo_i0_percent=_CFG["trafo_i0_percent"],
-            force_branch_shunt_pu=force_branch_shunt_pu,
-        )
+        out = case_generation_pandapower_stamped(**gen_kwargs)
     else:
-        out = case_generation_pandapower(
-            case_fn=case_fn,
-            case_kwargs={},
-            ybus_mode="ppcY",
-            seed=sample_seed,
-            jitter_load=float(_CFG["jitter_load"]),
-            jitter_gen=float(_CFG["jitter_gen"]),
-            pv_vset_range=_CFG["pv_vset_range"],
-            rand_u_start=bool(_CFG["rand_u_start"]),
-            angle_jitter_deg=float(_CFG["angle_jitter_deg"]),
-            mag_jitter_pq=float(_CFG["mag_jitter_pq"]),
-            trafo_pfe_kw=_CFG["trafo_pfe_kw"],
-            trafo_i0_percent=_CFG["trafo_i0_percent"],
-            force_branch_shunt_pu=force_branch_shunt_pu,
-        )
+        out = case_generation_pandapower(ybus_mode="ppcY", **gen_kwargs)
 
     (
         gridtype_out, bus_typ, s_multi, u_start, Y_matrix, is_connected,
@@ -301,15 +364,61 @@ def _generate_one_record_serialized() -> Dict[str, Any]:
     bus_number = int(len(bus_typ))
     branch_number = int(len(Branch_f_bus))
 
-    ymat_bytes = ndarray_to_npy_bytes(Y_matrix.copy()) if save_y_matrix else None
+    ymat_bytes = ndarray_to_npy_bytes(np.asarray(Y_matrix, dtype=np.complex128).copy()) if save_y_matrix else None
 
     if not is_connected:
-        u_newton = np.zeros_like(u_start, dtype=np.complex128)
-        S_newton = np.zeros_like(s_multi, dtype=np.complex128)
+        u_newton_si = np.zeros_like(u_start, dtype=np.complex128)
+        S_newton_si = np.zeros_like(s_multi, dtype=np.complex128)
     else:
-        u_newton, _I_unused, S_newton = newtonrapson(
-            bus_typ, Y_matrix.copy(), s_multi.copy(), u_start.copy(), K=K
+        bus_typ_arr = np.asarray(bus_typ, dtype=np.int64).copy()
+
+        if pu_nr:
+            Y_for_nr, S_for_nr, U_for_nr, Vbase_bus = convert_nr_inputs_to_pu(
+                Y_matrix_si=np.asarray(Y_matrix, dtype=np.complex128),
+                s_multi_si=np.asarray(s_multi, dtype=np.complex128),
+                u_start_si=np.asarray(u_start, dtype=np.complex128),
+                vn_kv=np.asarray(vn_kv, dtype=np.float64),
+                S_base=float(S_base),
+            )
+        else:
+            Y_for_nr = np.asarray(Y_matrix, dtype=np.complex128).copy()
+            S_for_nr = np.asarray(s_multi, dtype=np.complex128).copy()
+            U_for_nr = np.asarray(u_start, dtype=np.complex128).copy()
+            Vbase_bus = None
+
+        nr_out = newtonrapson(
+            bus_typ_arr,
+            Y_for_nr,
+            S_for_nr,
+            U_for_nr,
+            K=K,
+            diagnose=bool(_CFG["diagnose_nr"]),
+            print_misinf=bool(_CFG["print_misinf"]),
+            return_diagnostics=True,
+            near_misinf_tol=float(_CFG["near_misinf_tol"]),
+            convergence_mode=str(_CFG["convergence_mode"]),
+            step_tol=float(_CFG["step_tol"]),
+            mismatch_tol=float(_CFG["mismatch_tol"]),
         )
+
+        u_newton_raw, _I_unused, S_newton_raw, _nr_diag = nr_out
+
+        if pu_nr:
+            u_newton_arr = np.asarray(u_newton_raw)
+            s_newton_arr = np.asarray(S_newton_raw)
+
+            if u_newton_arr.size == 0:
+                u_newton_si = np.asarray(u_newton_arr, dtype=np.complex128)
+            else:
+                u_newton_si = u_pu_to_si_per_bus(u_newton_arr, Vbase_bus)
+
+            if s_newton_arr.size == 0:
+                S_newton_si = np.asarray(s_newton_arr, dtype=np.complex128)
+            else:
+                S_newton_si = s_pu_to_si(s_newton_arr, float(S_base))
+        else:
+            u_newton_si = np.asarray(u_newton_raw, dtype=np.complex128)
+            S_newton_si = np.asarray(S_newton_raw, dtype=np.complex128)
 
     rec = {
         "bus_number": bus_number,
@@ -318,31 +427,31 @@ def _generate_one_record_serialized() -> Dict[str, Any]:
         "U_base": float(U_base),
         "S_base": float(S_base),
 
-        "bus_typ": ndarray_to_npy_bytes(bus_typ.astype(np.int32)),
-        "vn_kv": ndarray_to_npy_bytes(vn_kv.astype(np.float64)),
-        "Y_shunt_bus": ndarray_to_npy_bytes(Y_shunt_bus.astype(np.complex128)),
+        "bus_typ": ndarray_to_npy_bytes(np.asarray(bus_typ, dtype=np.int32)),
+        "vn_kv": ndarray_to_npy_bytes(np.asarray(vn_kv, dtype=np.float64)),
+        "Y_shunt_bus": ndarray_to_npy_bytes(np.asarray(Y_shunt_bus, dtype=np.complex128)),
 
-        "Branch_f_bus": ndarray_to_npy_bytes(Branch_f_bus.astype(np.int32)),
-        "Branch_t_bus": ndarray_to_npy_bytes(Branch_t_bus.astype(np.int32)),
-        "Branch_status": ndarray_to_npy_bytes(Branch_status.astype(np.int8)),
-        "Branch_tau": ndarray_to_npy_bytes(Branch_tau.astype(np.float64)),
-        "Branch_shift_deg": ndarray_to_npy_bytes(Branch_shift_deg.astype(np.float64)),
-        "Branch_y_series_from": ndarray_to_npy_bytes(Branch_y_series_from.astype(np.complex128)),
-        "Branch_y_series_to": ndarray_to_npy_bytes(Branch_y_series_to.astype(np.complex128)),
-        "Branch_y_series_ft": ndarray_to_npy_bytes(Branch_y_series_ft.astype(np.complex128)),
-        "Branch_y_shunt_from": ndarray_to_npy_bytes(Branch_y_shunt_from.astype(np.complex128)),
-        "Branch_y_shunt_to": ndarray_to_npy_bytes(Branch_y_shunt_to.astype(np.complex128)),
-        "Is_trafo": ndarray_to_npy_bytes(Is_trafo.astype(np.int8)),
-        "Branch_hv_is_f": ndarray_to_npy_bytes(Branch_hv_is_f.astype(np.int8)),
-        "Branch_n": ndarray_to_npy_bytes(Branch_n.astype(np.float64)),
+        "Branch_f_bus": ndarray_to_npy_bytes(np.asarray(Branch_f_bus, dtype=np.int32)),
+        "Branch_t_bus": ndarray_to_npy_bytes(np.asarray(Branch_t_bus, dtype=np.int32)),
+        "Branch_status": ndarray_to_npy_bytes(np.asarray(Branch_status, dtype=np.int8)),
+        "Branch_tau": ndarray_to_npy_bytes(np.asarray(Branch_tau, dtype=np.float64)),
+        "Branch_shift_deg": ndarray_to_npy_bytes(np.asarray(Branch_shift_deg, dtype=np.float64)),
+        "Branch_y_series_from": ndarray_to_npy_bytes(np.asarray(Branch_y_series_from, dtype=np.complex128)),
+        "Branch_y_series_to": ndarray_to_npy_bytes(np.asarray(Branch_y_series_to, dtype=np.complex128)),
+        "Branch_y_series_ft": ndarray_to_npy_bytes(np.asarray(Branch_y_series_ft, dtype=np.complex128)),
+        "Branch_y_shunt_from": ndarray_to_npy_bytes(np.asarray(Branch_y_shunt_from, dtype=np.complex128)),
+        "Branch_y_shunt_to": ndarray_to_npy_bytes(np.asarray(Branch_y_shunt_to, dtype=np.complex128)),
+        "Is_trafo": ndarray_to_npy_bytes(np.asarray(Is_trafo, dtype=np.int8)),
+        "Branch_hv_is_f": ndarray_to_npy_bytes(np.asarray(Branch_hv_is_f, dtype=np.int8)),
+        "Branch_n": ndarray_to_npy_bytes(np.asarray(Branch_n, dtype=np.float64)),
 
-        "Y_Lines": ndarray_to_npy_bytes(Y_Lines.astype(np.complex128)),
-        "Y_C_Lines": ndarray_to_npy_bytes(Y_C_Lines.astype(np.float64)),
+        "Y_Lines": ndarray_to_npy_bytes(np.asarray(Y_Lines, dtype=np.complex128)),
+        "Y_C_Lines": ndarray_to_npy_bytes(np.asarray(Y_C_Lines, dtype=np.float64)),
 
-        "u_start": ndarray_to_npy_bytes(u_start.astype(np.complex128)),
-        "u_newton": ndarray_to_npy_bytes(u_newton.astype(np.complex128)),
-        "S_start": ndarray_to_npy_bytes(s_multi.astype(np.complex128)),
-        "S_newton": ndarray_to_npy_bytes(S_newton.astype(np.complex128)),
+        "u_start": ndarray_to_npy_bytes(np.asarray(u_start, dtype=np.complex128)),
+        "u_newton": ndarray_to_npy_bytes(np.asarray(u_newton_si, dtype=np.complex128)),
+        "S_start": ndarray_to_npy_bytes(np.asarray(s_multi, dtype=np.complex128)),
+        "S_newton": ndarray_to_npy_bytes(np.asarray(S_newton_si, dtype=np.complex128)),
     }
 
     if save_y_matrix:
@@ -392,7 +501,7 @@ def parse_args():
         help="Use pandapower ppcY directly or rebuild Y_matrix by stamping PPC.",
     )
 
-    parser.add_argument("--K", type=int, default=40, help="newton_raphson steps")
+    parser.add_argument("--K", type=int, default=40, help="Newton-Raphson max iterations")
     parser.add_argument("--runs", type=int, default=10000, help="Total samples")
     parser.add_argument("--save_steps", type=int, default=2000, help="Rows per Parquet append")
     parser.add_argument("--rows_per_task", type=int, default=1000, help="Rows per worker batch")
@@ -405,33 +514,59 @@ def parse_args():
     group.add_argument("--no_save_y_matrix", dest="save_y_matrix", action="store_false", help="Do not save Y_matrix")
     parser.set_defaults(save_y_matrix=True)
 
-    # Optional perturbations
-    parser.add_argument("--jitter_load", type=float, default=0.0)
-    parser.add_argument("--jitter_gen", type=float, default=0.0)
-    parser.add_argument("--pv_vset_lo", type=float, default=None)
-    parser.add_argument("--pv_vset_hi", type=float, default=None)
-    parser.add_argument("--rand_u_start", action="store_true")
-    parser.add_argument("--angle_jitter_deg", type=float, default=5.0)
-    parser.add_argument("--mag_jitter_pq", type=float, default=0.02)
+    parser.add_argument(
+        "--scenario_level",
+        type=str,
+        default="no_change",
+        choices=list(SCENARIO_PRESETS.keys()),
+        help="Scenario preset for perturbations.",
+    )
 
-    # Optional trafo magnetizing via net.trafo
-    parser.add_argument("--trafo_pfe_kw", type=float, default=None)
-    parser.add_argument("--trafo_i0_percent", type=float, default=None)
-
-    # Optional PPC forcing (best for cases with no net.trafo)
-    parser.add_argument("--auto_force_if_no_trafo_case", action="store_true",
-                        help="For known no-trafo cases, apply a default forced branch shunt (b=0.2 pu).")
+    parser.add_argument(
+        "--use_force_shunt_when_no_trafo",
+        action="store_true",
+        help="For known no-trafo cases, apply default forced branch shunt (b=0.2 pu).",
+    )
     parser.add_argument("--force_branch_shunt_g_pu", type=float, default=0.0)
     parser.add_argument("--force_branch_shunt_b_pu", type=float, default=0.0)
     parser.add_argument("--force_branch_shunt_g_asym_pu", type=float, default=0.0)
     parser.add_argument("--force_branch_shunt_b_asym_pu", type=float, default=0.0)
+
+    parser.add_argument("--trafo_pfe_kw", type=float, default=None)
+    parser.add_argument("--trafo_i0_percent", type=float, default=None)
+
+    parser.add_argument("--pu_nr", action="store_true", help="Solve NR in per-unit, save results back in SI.")
+    parser.add_argument("--diagnose_nr", action="store_true", help="Enable NR diagnostics.")
+    parser.add_argument("--print_misinf", action="store_true", help="Print NR mismatch per iteration.")
+    parser.add_argument("--near_misinf_tol", type=float, default=1e-3)
+    parser.add_argument(
+        "--start_mode",
+        type=str,
+        default="auto",
+        choices=["auto", "manual_flat", "ppc_v0", "dc_compile"],
+        help="Voltage start mode passed to case_generation_pandapower.",
+    )
+
+    parser.add_argument(
+        "--convergence_mode",
+        type=str,
+        default="misinf",
+        choices=["two_step", "misinf"],
+        help="NR convergence criterion.",
+    )
+    parser.add_argument("--step_tol", type=float, default=5e-4)
+    parser.add_argument("--mismatch_tol", type=float, default=1e-8)
 
     return parser.parse_args()
 
 
 def build_output_filename(args) -> str:
     mode = str(args.ybus_mode).strip()
-    name = f"{args.preset}_{mode}_{args.runs}_NR_branchrows_directSI.parquet"
+    nr_unit = "puNR" if args.pu_nr else "siNR"
+    name = (
+        f"{args.preset}_{mode}_{args.scenario_level}_{args.start_mode}_"
+        f"{nr_unit}_{args.runs}_NR_branchrows_directSI.parquet"
+    )
     return os.path.join(args.save_path, name)
 
 
@@ -446,9 +581,7 @@ def get_parquet_file_size(path: str) -> int:
 def main():
     args = parse_args()
 
-    pv_vset_range = None
-    if args.pv_vset_lo is not None and args.pv_vset_hi is not None:
-        pv_vset_range = (float(args.pv_vset_lo), float(args.pv_vset_hi))
+    scenario_cfg = SCENARIO_PRESETS[args.scenario_level]
 
     workers = args.workers if args.workers and args.workers > 0 else (os.cpu_count() or 1)
     runs = int(args.runs)
@@ -465,21 +598,31 @@ def main():
         K=int(args.K),
         save_y_matrix=save_y_matrix,
 
-        jitter_load=float(args.jitter_load),
-        jitter_gen=float(args.jitter_gen),
-        pv_vset_range=pv_vset_range,
-        rand_u_start=bool(args.rand_u_start),
-        angle_jitter_deg=float(args.angle_jitter_deg),
-        mag_jitter_pq=float(args.mag_jitter_pq),
+        jitter_load=float(scenario_cfg["jitter_load"]),
+        jitter_gen=float(scenario_cfg["jitter_gen"]),
+        pv_vset_range=scenario_cfg["pv_vset_range"],
+        rand_u_start=bool(scenario_cfg["rand_u_start"]),
+        angle_jitter_deg=float(scenario_cfg["angle_jitter_deg"]),
+        mag_jitter_pq=float(scenario_cfg["mag_jitter_pq"]),
 
         trafo_pfe_kw=args.trafo_pfe_kw,
         trafo_i0_percent=args.trafo_i0_percent,
 
-        auto_force_if_no_trafo_case=bool(args.auto_force_if_no_trafo_case),
+        use_force_shunt_when_no_trafo=bool(args.use_force_shunt_when_no_trafo),
         force_branch_shunt_g_pu=float(args.force_branch_shunt_g_pu),
         force_branch_shunt_b_pu=float(args.force_branch_shunt_b_pu),
         force_branch_shunt_g_asym_pu=float(args.force_branch_shunt_g_asym_pu),
         force_branch_shunt_b_asym_pu=float(args.force_branch_shunt_b_asym_pu),
+
+        pu_nr=bool(args.pu_nr),
+        diagnose_nr=bool(args.diagnose_nr),
+        print_misinf=bool(args.print_misinf),
+        near_misinf_tol=float(args.near_misinf_tol),
+        start_mode=str(args.start_mode).strip(),
+
+        convergence_mode=str(args.convergence_mode).strip(),
+        step_tol=float(args.step_tol),
+        mismatch_tol=float(args.mismatch_tol),
     )
 
     num_tasks = math.ceil(runs / rows_per_task)
@@ -499,11 +642,26 @@ def main():
         save_y_matrix=save_y_matrix,
     )
 
-    print(
-        f"[INFO] Starting generation with {workers} workers, "
-        f"{num_tasks} tasks, rows_per_task={rows_per_task}, "
-        f"save_steps={save_steps}, save_y_matrix={save_y_matrix}"
-    )
+    print("[INFO] Configuration")
+    print(f"  preset                    = {args.preset}")
+    print(f"  ybus_mode                 = {args.ybus_mode}")
+    print(f"  scenario_level            = {args.scenario_level}")
+    print(f"  scenario_cfg              = {scenario_cfg}")
+    print(f"  K                         = {args.K}")
+    print(f"  pu_nr                     = {args.pu_nr}")
+    print(f"  start_mode                = {args.start_mode}")
+    print(f"  use_force_shunt_when_no_trafo = {args.use_force_shunt_when_no_trafo}")
+    print(f"  diagnose_nr               = {args.diagnose_nr}")
+    print(f"  convergence_mode          = {args.convergence_mode}")
+    print(f"  step_tol                  = {args.step_tol}")
+    print(f"  mismatch_tol              = {args.mismatch_tol}")
+    print(f"  workers                   = {workers}")
+    print(f"  rows_per_task             = {rows_per_task}")
+    print(f"  save_steps                = {save_steps}")
+    print(f"  save_y_matrix             = {save_y_matrix}")
+
+    if args.print_misinf and workers != 1:
+        print("[WARN] print_misinf=True with workers>1 will produce interleaved logs.")
 
     buffer: List[Dict[str, Any]] = []
 

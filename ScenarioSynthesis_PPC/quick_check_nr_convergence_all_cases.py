@@ -611,7 +611,7 @@ if __name__ == "__main__":
         workers=0,   # 0 => all CPU cores
         chunksize=1,
         use_force_shunt_when_no_trafo=True,
-        pu_nr=True,          # per-unit NR
+        pu_nr=False,          # per-unit NR
         diagnose_nr=True,    # store and classify non-convergence
         print_misinf=False,  # set True only when workers=1 for readable logs
         near_misinf_tol=1e-3,
