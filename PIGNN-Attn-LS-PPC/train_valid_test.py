@@ -66,10 +66,16 @@ parser.add_argument("--VAL_EVERY", type=int, default=1)
 
 parser.add_argument("--PARQUET", type=str, nargs='+', required=True, help="Path to parquet data file(s)")
 parser.add_argument("--seed_value", type=int, default=42)
+parser.add_argument(
+    "--no_cache_dense_ybus",
+    "--no_cach_dense_ybus",
+    action="store_true",
+    help="Do not precompute/store dense Ybus in the dataset; reconstruct it inside the model instead",
+)
 
 # NEW
 parser.add_argument("--log_to_file", action="store_true", help="Save terminal output to a log file as well")
-parser.add_argument("--log_dir", type=str, default="./results", help="Directory for log file")
+parser.add_argument("--log_dir", type=str, default="./results/logs", help="Directory for log file")
 
 args = parser.parse_args()
 
@@ -133,7 +139,12 @@ parquet_filename = '_and_'.join(shortened_names)
 armijo_tag = "True" if args.use_armijo else "False"
 
 
-RUNNAME = f"{parquet_filename}_K{args.K}_d{args.d}_dhi{args.d_hi}_numattn{args.num_attn_layers}_armijo{armijo_tag}_ep{args.EPOCHS}_TrainRatio{args.train_ratio}"
+RUNNAME = (
+    f"{parquet_filename}_K{args.K}_d{args.d}_dhi{args.d_hi}"
+    f"_nheads{args.n_heads}_numattn{args.num_attn_layers}"
+    f"_armijo{armijo_tag}_ep{args.EPOCHS}_TrainRatio{args.train_ratio}"
+)
+BEST_CKPT_PATH = f"./results/ckpt/{RUNNAME}_{EPOCHS}_best_model.ckpt"
 if args.log_to_file:
     os.makedirs(args.log_dir, exist_ok=True)
     log_filename = os.path.join(args.log_dir, f"{RUNNAME}_training_log.txt")
@@ -164,8 +175,9 @@ if args.log_to_file:
     print(f"[logging] stdout/stderr will also be saved to: {log_filename}")
 
 print(
-    f"MODEL:{MODEL}, PINN:{PINN}, Block:{BLOCK_DIAG}, d:{d}, d_hi:{d_hi}, "
-    f"K:{K}, Runname:{RUNNAME}, PARQUET:{PARQUET}, BATCH:{BATCH}, EP:{EPOCHS}, LR:{LR}"
+    f"MODEL:{MODEL}, PINN:{PINN}, Block:{BLOCK_DIAG}, d:{d}, d_hi:{d_hi}, n_heads:{n_heads}, "
+    f"K:{K}, Runname:{RUNNAME}, PARQUET:{PARQUET}, BATCH:{BATCH}, EP:{EPOCHS}, LR:{LR}, "
+    f"no_cache_dense_ybus:{args.no_cache_dense_ybus}"
 )
 
 
@@ -179,7 +191,12 @@ print("Using device:", device)
 # ------------------------------------------------------------------
 # Dataset / split
 # ------------------------------------------------------------------
-full_ds = ChanghunDataset(PARQUET, per_unit=PER_UNIT, device=None)
+full_ds = ChanghunDataset(
+    PARQUET,
+    per_unit=PER_UNIT,
+    device=None,
+    no_cache_dense_ybus=args.no_cache_dense_ybus,
+)
 
 n_total = len(full_ds)
 n_train = int(args.train_ratio * n_total)
@@ -330,6 +347,193 @@ else:
     scheduler = None
 
 
+def _real_dtype(dtype: torch.dtype) -> torch.dtype:
+    if dtype == torch.complex64:
+        return torch.float32
+    if dtype == torch.complex128:
+        return torch.float64
+    return dtype
+
+
+def build_dense_y_from_branchrows_single(
+    N,
+    Branch_f_bus,
+    Branch_t_bus,
+    Branch_status,
+    Branch_tau,
+    Branch_shift_deg,
+    Branch_y_series_from,
+    Branch_y_series_to,
+    Branch_y_series_ft,
+    Branch_y_shunt_from,
+    Branch_y_shunt_to,
+    Y_shunt_bus,
+):
+    device = Branch_f_bus.device
+    dtype = Branch_y_series_ft.dtype
+
+    Y = torch.zeros(N, N, dtype=dtype, device=device)
+    Y.diagonal().add_(Y_shunt_bus.to(dtype))
+
+    mask = (Branch_status != 0)
+    if mask.sum() == 0:
+        return Y
+
+    f = Branch_f_bus[mask].long()
+    t = Branch_t_bus[mask].long()
+
+    real_dtype = _real_dtype(dtype)
+    tau = Branch_tau[mask].to(real_dtype)
+    theta = torch.deg2rad(Branch_shift_deg[mask].to(real_dtype))
+    a = tau.to(dtype) * torch.exp(1j * theta.to(dtype))
+
+    y_from = Branch_y_series_from[mask].to(dtype)
+    y_to = Branch_y_series_to[mask].to(dtype)
+    y_ft = Branch_y_series_ft[mask].to(dtype)
+    ysh_f = Branch_y_shunt_from[mask].to(dtype)
+    ysh_t = Branch_y_shunt_to[mask].to(dtype)
+
+    Yff = (y_from + ysh_f / 2.0) / (a * torch.conj(a))
+    Ytt = (y_to + ysh_t / 2.0)
+    Yft = -y_ft / torch.conj(a)
+    Ytf = -y_ft / a
+
+    Y.index_put_((f, f), Yff, accumulate=True)
+    Y.index_put_((t, t), Ytt, accumulate=True)
+    Y.index_put_((f, t), Yft, accumulate=True)
+    Y.index_put_((t, f), Ytf, accumulate=True)
+
+    return Y
+
+
+def ensure_dense_y_for_metrics(
+    Y,
+    bus_type,
+    Branch_f_bus,
+    Branch_t_bus,
+    Branch_status,
+    Branch_tau,
+    Branch_shift_deg,
+    Branch_y_series_from,
+    Branch_y_series_to,
+    Branch_y_series_ft,
+    Branch_y_shunt_from,
+    Branch_y_shunt_to,
+    Y_shunt_bus,
+):
+    if Y is not None:
+        return Y.unsqueeze(0) if Y.dim() == 2 else Y
+
+    if Y_shunt_bus is None:
+        raise ValueError("Y is None and Y_shunt_bus is None; cannot reconstruct Y for residual metrics.")
+
+    B, N = bus_type.shape
+    if B == 1:
+        return build_dense_y_from_branchrows_single(
+            N,
+            Branch_f_bus.squeeze(0),
+            Branch_t_bus.squeeze(0),
+            Branch_status.squeeze(0),
+            Branch_tau.squeeze(0),
+            Branch_shift_deg.squeeze(0),
+            Branch_y_series_from.squeeze(0),
+            Branch_y_series_to.squeeze(0),
+            Branch_y_series_ft.squeeze(0),
+            Branch_y_shunt_from.squeeze(0),
+            Branch_y_shunt_to.squeeze(0),
+            Y_shunt_bus.squeeze(0),
+        ).unsqueeze(0)
+
+    Ys = []
+    for b in range(B):
+        Ys.append(build_dense_y_from_branchrows_single(
+            N,
+            Branch_f_bus[b],
+            Branch_t_bus[b],
+            Branch_status[b],
+            Branch_tau[b],
+            Branch_shift_deg[b],
+            Branch_y_series_from[b],
+            Branch_y_series_to[b],
+            Branch_y_series_ft[b],
+            Branch_y_shunt_from[b],
+            Branch_y_shunt_to[b],
+            Y_shunt_bus[b],
+        ))
+    return torch.stack(Ys, dim=0)
+
+
+def compute_power_flow_residual_metrics(Y, Vpred, Sset, bus_type, *, n_nodes_per_graph=None, S_base=None):
+    v = Vpred[..., 0]
+    th = Vpred[..., 1]
+
+    if Y.dim() == 2:
+        Y = Y.unsqueeze(0)
+
+    Vc = v * torch.exp(1j * th)
+    Ic = torch.matmul(Y, Vc.unsqueeze(-1)).squeeze(-1)
+    Sc = Vc * Ic.conj()
+
+    P_set, Q_set = Sset.real, Sset.imag
+    slack_mask = (bus_type == 1)
+    pv_mask = (bus_type == 2)
+
+    dp_abs = (P_set - Sc.real).abs()
+    dq_abs = (Q_set - Sc.imag).abs()
+    p_mask = ~slack_mask
+    q_mask = ~(slack_mask | pv_mask)
+
+    if n_nodes_per_graph is not None:
+        max_dp_pu = []
+        max_dq_pu = []
+        offset = 0
+        for size in n_nodes_per_graph.tolist():
+            size = int(size)
+            sl = slice(offset, offset + size)
+
+            dp_g = dp_abs[0, sl]
+            dq_g = dq_abs[0, sl]
+            p_mask_g = p_mask[0, sl]
+            q_mask_g = q_mask[0, sl]
+
+            if p_mask_g.any():
+                max_dp_pu.append(dp_g[p_mask_g].max())
+            else:
+                max_dp_pu.append(dp_g.new_zeros(()))
+
+            if q_mask_g.any():
+                max_dq_pu.append(dq_g[q_mask_g].max())
+            else:
+                max_dq_pu.append(dq_g.new_zeros(()))
+
+            offset += size
+
+        max_dp_pu = torch.stack(max_dp_pu)
+        max_dq_pu = torch.stack(max_dq_pu)
+    else:
+        max_dp_pu = dp_abs.masked_fill(~p_mask, 0.0).amax(dim=-1)
+        max_dq_pu = dq_abs.masked_fill(~q_mask, 0.0).amax(dim=-1)
+        max_dq_pu = torch.where(q_mask.any(dim=-1), max_dq_pu, torch.zeros_like(max_dq_pu))
+
+    metrics = {
+        "max_dp_pu": max_dp_pu,
+        "max_dq_pu": max_dq_pu,
+    }
+
+    if S_base is not None:
+        S_base = S_base.to(max_dp_pu.device, dtype=max_dp_pu.dtype).reshape(-1)
+        if S_base.numel() == 1 and max_dp_pu.numel() != 1:
+            S_base = S_base.expand(max_dp_pu.numel())
+        metrics["max_dp_mva"] = max_dp_pu * S_base
+        metrics["max_dq_mva"] = max_dq_pu * S_base
+
+    return metrics
+
+
+def format_residual_summary(max_dp_pu, max_dq_pu):
+    return f"(ΔP∞ {max_dp_pu:.3e} pu, ΔQ∞ {max_dq_pu:.3e} pu)"
+
+
 # ------------------------------------------------------------------
 # Epoch runner
 # ------------------------------------------------------------------
@@ -340,6 +544,10 @@ def run_epoch(loader, *, train: bool, pinn: bool):
     sum_mse = 0.0
     sum_mse_mag = 0.0
     sum_mse_ang = 0.0
+    sum_max_dp_pu = 0.0
+    sum_max_dq_pu = 0.0
+    sum_max_dp_mva = 0.0
+    sum_max_dq_mva = 0.0
     n_graphs_total = 0
 
     with torch.set_grad_enabled(train):
@@ -373,7 +581,12 @@ def run_epoch(loader, *, train: bool, pinn: bool):
             Is_trafo = batch["Is_trafo"].to(device)
             Y_shunt_bus = batch["Y_shunt_bus"].to(device)
 
-            Y = batch["Ybus"].to(device)
+            Y = batch.get("Ybus", None)
+            if Y is not None:
+                Y = Y.to(device)
+            S_base = batch.get("S_base", None)
+            if S_base is not None:
+                S_base = S_base.to(device)
 
             Sstart = batch["S_start"].to(device)
             Ustart = batch["U_start"].to(device)
@@ -434,6 +647,29 @@ def run_epoch(loader, *, train: bool, pinn: bool):
                 mse = mse_mag + mse_ang
                 loss = mse
 
+            residual_metrics = compute_power_flow_residual_metrics(
+                ensure_dense_y_for_metrics(
+                    Y,
+                    bus_type,
+                    Branch_f_bus,
+                    Branch_t_bus,
+                    Branch_status,
+                    Branch_tau,
+                    Branch_shift_deg,
+                    Branch_y_series_from,
+                    Branch_y_series_to,
+                    Branch_y_series_ft,
+                    Branch_y_shunt_from,
+                    Branch_y_shunt_to,
+                    Y_shunt_bus,
+                ),
+                Vpred,
+                Sstart,
+                bus_type,
+                n_nodes_per_graph=n_nodes_per_graph,
+                S_base=S_base,
+            )
+
             if train:
                 optim.zero_grad()
                 loss.backward()
@@ -446,12 +682,30 @@ def run_epoch(loader, *, train: bool, pinn: bool):
             sum_mse += mse.item() * B_eff
             sum_mse_mag += mse_mag.item() * B_eff
             sum_mse_ang += mse_ang.item() * B_eff
+            sum_max_dp_pu += residual_metrics["max_dp_pu"].sum().item()
+            sum_max_dq_pu += residual_metrics["max_dq_pu"].sum().item()
+            if "max_dp_mva" in residual_metrics:
+                sum_max_dp_mva += residual_metrics["max_dp_mva"].sum().item()
+                sum_max_dq_mva += residual_metrics["max_dq_mva"].sum().item()
 
     mean_loss = sum_loss / max(n_graphs_total, 1)
     mean_mse = sum_mse / max(n_graphs_total, 1)
     mean_mse_mag = sum_mse_mag / max(n_graphs_total, 1)
     mean_mse_ang = sum_mse_ang / max(n_graphs_total, 1)
-    return mean_loss, mean_mse, mean_mse_mag, mean_mse_ang
+    mean_max_dp_pu = sum_max_dp_pu / max(n_graphs_total, 1)
+    mean_max_dq_pu = sum_max_dq_pu / max(n_graphs_total, 1)
+    mean_max_dp_mva = sum_max_dp_mva / max(n_graphs_total, 1)
+    mean_max_dq_mva = sum_max_dq_mva / max(n_graphs_total, 1)
+    return (
+        mean_loss,
+        mean_mse,
+        mean_mse_mag,
+        mean_mse_ang,
+        mean_max_dp_pu,
+        mean_max_dq_pu,
+        mean_max_dp_mva,
+        mean_max_dq_mva,
+    )
 
 
 # ------------------------------------------------------------------
@@ -467,12 +721,30 @@ if "train" in args.mode:
     best_val_loss = float('inf')
 
     print("Initial metrics before training:")
-    train_loss, train_mse, train_mse_mag, train_mse_ang = run_epoch(train_loader, train=False, pinn=PINN)
+    (
+        train_loss,
+        train_mse,
+        train_mse_mag,
+        train_mse_ang,
+        train_max_dp_pu,
+        train_max_dq_pu,
+        _train_max_dp_mva,
+        _train_max_dq_mva,
+    ) = run_epoch(train_loader, train=False, pinn=PINN)
     train_rmse = math.sqrt(train_mse)
     train_rmse_mag = math.sqrt(train_mse_mag)
     train_rmse_ang_deg = math.sqrt(train_mse_ang) * (180.0 / math.pi)
 
-    val_loss, val_mse, val_mse_mag, val_mse_ang = run_epoch(val_loader, train=False, pinn=PINN)
+    (
+        val_loss,
+        val_mse,
+        val_mse_mag,
+        val_mse_ang,
+        val_max_dp_pu,
+        val_max_dq_pu,
+        _val_max_dp_mva,
+        _val_max_dq_mva,
+    ) = run_epoch(val_loader, train=False, pinn=PINN)
     val_rmse = math.sqrt(val_mse)
     val_rmse_mag = math.sqrt(val_mse_mag)
     val_rmse_ang_deg = math.sqrt(val_mse_ang) * (180.0 / math.pi)
@@ -480,15 +752,26 @@ if "train" in args.mode:
     print(
         f"Epoch   0 | "
         f"train loss {train_loss:.4e}  rmse {train_rmse:.4e} "
-        f"(mag {train_rmse_mag:.4e}, ang {train_rmse_ang_deg:.4e}°) | "
+        f"(mag {train_rmse_mag:.4e}, ang {train_rmse_ang_deg:.4e}°) "
+        f"{format_residual_summary(train_max_dp_pu, train_max_dq_pu)} | "
         f"valid loss {val_loss:.4e}  rmse {val_rmse:.4e} "
-        f"(mag {val_rmse_mag:.4e}, ang {val_rmse_ang_deg:.4e}°)"
+        f"(mag {val_rmse_mag:.4e}, ang {val_rmse_ang_deg:.4e}°) "
+        f"{format_residual_summary(val_max_dp_pu, val_max_dq_pu)}"
     )
 
     for epoch in range(1, EPOCHS + 1):
         t0 = time.time()
 
-        train_loss, train_mse, train_mse_mag, train_mse_ang = run_epoch(train_loader, train=True, pinn=PINN)
+        (
+            train_loss,
+            train_mse,
+            train_mse_mag,
+            train_mse_ang,
+            train_max_dp_pu,
+            train_max_dq_pu,
+            _train_max_dp_mva,
+            _train_max_dq_mva,
+        ) = run_epoch(train_loader, train=True, pinn=PINN)
         train_rmse = math.sqrt(train_mse)
         train_rmse_mag = math.sqrt(train_mse_mag)
         train_rmse_ang_deg = math.sqrt(train_mse_ang) * (180.0 / math.pi)
@@ -499,7 +782,16 @@ if "train" in args.mode:
         train_rmse_ang_hist_deg.append(train_rmse_ang_deg)
 
         if epoch % VAL_EVERY == 0 or epoch == EPOCHS:
-            val_loss, val_mse, val_mse_mag, val_mse_ang = run_epoch(val_loader, train=False, pinn=PINN)
+            (
+                val_loss,
+                val_mse,
+                val_mse_mag,
+                val_mse_ang,
+                val_max_dp_pu,
+                val_max_dq_pu,
+                _val_max_dp_mva,
+                _val_max_dq_mva,
+            ) = run_epoch(val_loader, train=False, pinn=PINN)
             val_rmse = math.sqrt(val_mse)
             val_rmse_mag = math.sqrt(val_mse_mag)
             val_rmse_ang_deg = math.sqrt(val_mse_ang) * (180.0 / math.pi)
@@ -512,22 +804,24 @@ if "train" in args.mode:
             print(
                 f"Epoch {epoch:3d} | "
                 f"train loss {train_loss:.4e}  rmse {train_rmse:.4e} "
-                f"(mag {train_rmse_mag:.4e}, ang {train_rmse_ang_deg:.4e}°) | "
+                f"(mag {train_rmse_mag:.4e}, ang {train_rmse_ang_deg:.4e}°) "
+                f"{format_residual_summary(train_max_dp_pu, train_max_dq_pu)} | "
                 f"valid loss {val_loss:.4e}  rmse {val_rmse:.4e} "
-                f"(mag {val_rmse_mag:.4e}, ang {val_rmse_ang_deg:.4e}°) | "
+                f"(mag {val_rmse_mag:.4e}, ang {val_rmse_ang_deg:.4e}°) "
+                f"{format_residual_summary(val_max_dp_pu, val_max_dq_pu)} | "
                 f"time {time.time() - t0:.2f}s"
             )
 
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
-                ckpt_path = f"./results/ckpt/{RUNNAME}_{EPOCHS}_best_model.ckpt"
-                torch.save(model.state_dict(), ckpt_path)
-                print(f"  ↳ checkpoint saved to {ckpt_path}")
+                torch.save(model.state_dict(), BEST_CKPT_PATH)
+                print(f"  ↳ checkpoint saved to {BEST_CKPT_PATH}")
         else:
             print(
                 f"Epoch {epoch:3d} | "
                 f"train loss {train_loss:.4e}  rmse {train_rmse:.4e} "
-                f"(mag {train_rmse_mag:.4e}, ang {train_rmse_ang_deg:.4e}°) | "
+                f"(mag {train_rmse_mag:.4e}, ang {train_rmse_ang_deg:.4e}°) "
+                f"{format_residual_summary(train_max_dp_pu, train_max_dq_pu)} | "
                 f"time {time.time() - t0:.2f}s"
             )
 
@@ -585,7 +879,22 @@ if "train" in args.mode:
 # Final test
 # ------------------------------------------------------------------
 if "test" in args.mode:
-    test_loss, test_mse, test_mse_mag, test_mse_ang = run_epoch(test_loader, train=False, pinn=PINN)
+    if os.path.exists(BEST_CKPT_PATH):
+        model.load_state_dict(torch.load(BEST_CKPT_PATH, map_location=device))
+        print(f"[test] loaded best checkpoint: {BEST_CKPT_PATH}")
+    else:
+        print(f"[test] best checkpoint not found at {BEST_CKPT_PATH}; using current model weights.")
+
+    (
+        test_loss,
+        test_mse,
+        test_mse_mag,
+        test_mse_ang,
+        test_max_dp_pu,
+        test_max_dq_pu,
+        test_max_dp_mva,
+        test_max_dq_mva,
+    ) = run_epoch(test_loader, train=False, pinn=PINN)
 
     test_rmse = math.sqrt(test_mse)
     test_rmse_mag = math.sqrt(test_mse_mag)
@@ -597,6 +906,8 @@ if "test" in args.mode:
             f" | total RMSE : {test_rmse:.4e}"
             f" | |V| RMSE : {test_rmse_mag:.4e}"
             f" | θ RMSE : {test_rmse_ang_deg:.4e}°"
+            f" | ΔP∞ : {test_max_dp_pu:.4e} pu ({test_max_dp_mva:.4e} MW)"
+            f" | ΔQ∞ : {test_max_dq_pu:.4e} pu ({test_max_dq_mva:.4e} MVAr)"
         )
     else:
         print(

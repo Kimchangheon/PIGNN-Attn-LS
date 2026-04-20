@@ -14,6 +14,8 @@ unset SLURM_EXPORT_ENV
 
 # (Optional) load your Python/solver modules here
 module load python
+conda activate
+conda activate $WORK/conda-envs/Python3.12_PandaPower3.4.0
 # module load petsc        # if you use PETSc via mpi4py
 
 # Your project environment
@@ -25,14 +27,14 @@ srun python main_datagen_multiproc_improved.py \
   --preset case30 \
   --ybus_mode ppcY \
   --runs 36000 \
-  --workers 0 \
-  --rows_per_task 2000 \
-  --save_steps 6000 \
-  --jitter_load 0.10 \
-  --pv_vset_lo 0.98 \
-  --pv_vset_hi 1.04 \
-  --rand_u_start \
-  --angle_jitter_deg 5 \
-  --mag_jitter_pq 0.02 \
+  --rows_per_task 1500 \
+  --save_steps 3000 \
+  --no_save_y_matrix \
+  --scenario_level A \
+  --K 40 \
+  --use_force_shunt_when_no_trafo \
+  --start_mode dc_compile \
+  --diagnose_nr \
+  --convergence_mode misinf \
   --save_path ./out \
   --overwrite

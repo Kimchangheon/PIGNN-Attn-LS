@@ -29,6 +29,13 @@ class LearningBlock(nn.Module):
 # Helpers
 # -----------------------------------------------------------------------
 
+def _real_dtype(dtype: torch.dtype) -> torch.dtype:
+    if dtype == torch.complex64:
+        return torch.float32
+    if dtype == torch.complex128:
+        return torch.float64
+    return dtype
+
 def _batched_mismatch_inf_norm(Y, v, th, P_set, Q_set, slack_mask, pv_mask):
     """
     Y:   (B,N,N) or (N,N)
@@ -78,8 +85,9 @@ def _build_dense_Y_from_branchrows_single(
     f = Branch_f_bus[mask].long()
     t = Branch_t_bus[mask].long()
 
-    tau = Branch_tau[mask].to(dtype.real_dtype)
-    theta = torch.deg2rad(Branch_shift_deg[mask].to(dtype.real_dtype))
+    real_dtype = _real_dtype(dtype)
+    tau = Branch_tau[mask].to(real_dtype)
+    theta = torch.deg2rad(Branch_shift_deg[mask].to(real_dtype))
     a = tau.to(dtype) * torch.exp(1j * theta.to(dtype))
 
     y_from = Branch_y_series_from[mask].to(dtype)

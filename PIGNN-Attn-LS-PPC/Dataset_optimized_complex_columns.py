@@ -143,7 +143,7 @@ class ChanghunDataset(Dataset):
       - voltages use per-bus base
       - powers use S_base
     """
-    __slots__ = ("rows", "_per_unit", "_device")
+    __slots__ = ("rows", "_per_unit", "_device", "_no_cache_dense_ybus")
 
     def __init__(
         self,
@@ -151,9 +151,11 @@ class ChanghunDataset(Dataset):
         *,
         per_unit: bool = False,
         device: Optional[Union[str, torch.device]] = None,
+        no_cache_dense_ybus: bool = False,
     ):
         self._per_unit = bool(per_unit)
         self._device = torch.device(device) if device is not None else None
+        self._no_cache_dense_ybus = bool(no_cache_dense_ybus)
 
         if isinstance(paths, (str, Path)):
             paths = [paths]
@@ -179,12 +181,13 @@ class ChanghunDataset(Dataset):
             "Branch_n",
             "Y_Lines",
             "Y_C_Lines",
-            "Y_matrix",
             "u_start",
             "u_newton",
             "S_start",
             "S_newton",
         ]
+        if not self._no_cache_dense_ybus:
+            binary_cols_master.insert(binary_cols_master.index("u_start"), "Y_matrix")
 
         for path in paths:
             print(f"Processing file {path} ...")
@@ -258,22 +261,25 @@ class ChanghunDataset(Dataset):
             S_newton = _as_np(r["S_newton"], COMPLEX_DTYPE).reshape(N)
 
             # ---- Ybus in SI ----
-            if "Y_matrix" in df.columns and r.get("Y_matrix", None) is not None:
-                Ybus_si = _as_np(r["Y_matrix"], COMPLEX_DTYPE).reshape(N, N)
-            else:
-                Ybus_si = reconstruct_Y_pandapower_branchrows_direct_SI_np(
-                    N,
-                    Branch_f_bus, Branch_t_bus, Branch_status,
-                    Branch_tau, Branch_shift_deg,
-                    Branch_y_series_from, Branch_y_series_to, Branch_y_series_ft,
-                    Branch_y_shunt_from, Branch_y_shunt_to,
-                    Y_shunt_bus,
-                )
+            Ybus = None
+            if not self._no_cache_dense_ybus:
+                if "Y_matrix" in df.columns and r.get("Y_matrix", None) is not None:
+                    Ybus_si = _as_np(r["Y_matrix"], COMPLEX_DTYPE).reshape(N, N)
+                else:
+                    Ybus_si = reconstruct_Y_pandapower_branchrows_direct_SI_np(
+                        N,
+                        Branch_f_bus, Branch_t_bus, Branch_status,
+                        Branch_tau, Branch_shift_deg,
+                        Branch_y_series_from, Branch_y_series_to, Branch_y_series_ft,
+                        Branch_y_shunt_from, Branch_y_shunt_to,
+                        Y_shunt_bus,
+                    )
 
             # ---- per-unit conversion using CORRECT local bases ----
             if self._per_unit:
                 # dense Ybus
-                Ybus = ybus_si_to_pu(Ybus_si, Vbase_bus, S_base)
+                if not self._no_cache_dense_ybus:
+                    Ybus = ybus_si_to_pu(Ybus_si, Vbase_bus, S_base)
 
                 # bus shunts
                 Y_shunt_bus = ysh_bus_si_to_pu(Y_shunt_bus, Vbase_bus, S_base)
@@ -320,7 +326,7 @@ class ChanghunDataset(Dataset):
                 S_start = s_si_to_pu(S_start, S_base)
                 S_newton = s_si_to_pu(S_newton, S_base)
 
-            else:
+            elif not self._no_cache_dense_ybus:
                 Ybus = Ybus_si.astype(COMPLEX_DTYPE, copy=False)
 
             V_start = np.stack(
@@ -335,8 +341,8 @@ class ChanghunDataset(Dataset):
             row: Dict[str, Any] = {
                 "N": N,
                 "nl": nl,
-                "S_base": np.array(S_base, dtype=FLOAT_DTYPE),
-                "U_base": np.array(U_base_scalar, dtype=FLOAT_DTYPE),
+                "S_base": to_t(np.array(S_base, dtype=FLOAT_DTYPE), dtype=torch.float32),
+                "U_base": to_t(np.array(U_base_scalar, dtype=FLOAT_DTYPE), dtype=torch.float32),
 
                 "bus_type": to_t(bus_typ, dtype=torch.int64),
                 "vn_kv": to_t(vn_kv, dtype=torch.float32),
@@ -362,8 +368,6 @@ class ChanghunDataset(Dataset):
                 "Y_Lines": to_t(Y_Lines, dtype=torch.complex64),
                 "Y_C_Lines": to_t(Y_C_Lines, dtype=torch.float32),
 
-                "Ybus": to_t(Ybus, dtype=torch.complex64),
-
                 "U_start": to_t(u_start, dtype=torch.complex64),
                 "U_newton": to_t(u_newton, dtype=torch.complex64),
                 "V_start": to_t(V_start, dtype=torch.float32),
@@ -371,6 +375,8 @@ class ChanghunDataset(Dataset):
                 "S_start": to_t(S_start, dtype=torch.complex64),
                 "S_newton": to_t(S_newton, dtype=torch.complex64),
             }
+            if not self._no_cache_dense_ybus:
+                row["Ybus"] = to_t(Ybus, dtype=torch.complex64)
 
             self.rows.append(row)
 

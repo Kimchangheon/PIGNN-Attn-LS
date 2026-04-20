@@ -17,6 +17,11 @@ _VECTOR_FIELDS = [
     "S_newton",
 ]
 
+_SCALAR_FIELDS = [
+    "S_base",
+    "U_base",
+]
+
 _TWO_CHANNEL_FIELDS = [
     "V_start",
     "V_newton",
@@ -95,6 +100,11 @@ def collate_blockdiag(samples: List[Dict[str, torch.Tensor]]) -> Dict[str, Union
     out.update(_concat_present(samples, _TWO_CHANNEL_FIELDS, dim=0))
     out.update(_concat_present(samples, _BRANCH_FIELDS, dim=0))
 
+    for name in _SCALAR_FIELDS:
+        vals = [s.get(name, None) for s in samples]
+        if all(isinstance(v, torch.Tensor) for v in vals):
+            out[name] = torch.stack([v.reshape(()) for v in vals], dim=0)
+
     for name in _BRANCH_INDEX_FIELDS:
         vals = []
         for s, off in zip(samples, offsets):
@@ -108,7 +118,7 @@ def collate_blockdiag(samples: List[Dict[str, torch.Tensor]]) -> Dict[str, Union
         out["Ybus"] = None
 
     for k, v in list(out.items()):
-        if isinstance(v, torch.Tensor):
+        if isinstance(v, torch.Tensor) and k not in _SCALAR_FIELDS:
             out[k] = v.unsqueeze(0)
 
     out["sizes"] = sizes
