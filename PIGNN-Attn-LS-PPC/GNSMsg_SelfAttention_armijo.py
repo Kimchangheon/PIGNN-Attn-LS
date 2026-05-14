@@ -71,10 +71,10 @@ def _build_dense_Y_from_branchrows_single(
     Y_shunt_bus: torch.Tensor,
 ) -> torch.Tensor:
     """
-    Direct-SI dense Ybus reconstruction from one metadata row per PPC branch row.
+    Dense Ybus reconstruction from one metadata row per PPC branch row.
     """
     device = Branch_f_bus.device
-    dtype = Branch_y_series_ft.dtype
+    dtype = Branch_y_series_from.dtype
 
     Y = torch.zeros(N, N, dtype=dtype, device=device)
     Y.diagonal().add_(Y_shunt_bus.to(dtype))
@@ -93,14 +93,13 @@ def _build_dense_Y_from_branchrows_single(
 
     y_from = Branch_y_series_from[mask].to(dtype)
     y_to   = Branch_y_series_to[mask].to(dtype)
-    y_ft   = Branch_y_series_ft[mask].to(dtype)
     ysh_f  = Branch_y_shunt_from[mask].to(dtype)
     ysh_t  = Branch_y_shunt_to[mask].to(dtype)
 
     Yff = (y_from + ysh_f / 2.0) / (a * torch.conj(a))
     Ytt = (y_to   + ysh_t / 2.0)
-    Yft = -y_ft / torch.conj(a)
-    Ytf = -y_ft / a
+    Yft = -y_from / torch.conj(a)
+    Ytf = -y_to / a
 
     Y.index_put_((f, f), Yff, accumulate=True)
     Y.index_put_((t, t), Ytt, accumulate=True)
@@ -116,6 +115,8 @@ def _build_directed_edges_single(
     Branch_status: torch.Tensor,
     Branch_tau: torch.Tensor,
     Branch_shift_deg: torch.Tensor,
+    Branch_y_series_from: torch.Tensor,
+    Branch_y_series_to: torch.Tensor,
     Branch_y_series_ft: torch.Tensor,
     Branch_y_shunt_from: torch.Tensor,
     Branch_y_shunt_to: torch.Tensor,
@@ -133,7 +134,7 @@ def _build_directed_edges_single(
     Edge feature for t->f swaps the shunts and flips theta sign.
     """
     device = Branch_f_bus.device
-    ctype = Branch_y_series_ft.dtype
+    ctype = Branch_y_series_from.dtype
     rtype = Branch_tau.dtype
 
     mask = (Branch_status != 0)
@@ -152,12 +153,13 @@ def _build_directed_edges_single(
 
     a = tau.to(ctype) * torch.exp(1j * theta.to(ctype))
 
-    y_ft = Branch_y_series_ft[mask].to(ctype)
+    y_from = Branch_y_series_from[mask].to(ctype)
+    y_to = Branch_y_series_to[mask].to(ctype)
     ysh_f = Branch_y_shunt_from[mask].to(ctype)
     ysh_t = Branch_y_shunt_to[mask].to(ctype)
 
-    ydir_ft = -y_ft / torch.conj(a)  # f -> t
-    ydir_tf = -y_ft / a              # t -> f
+    ydir_ft = -y_from / torch.conj(a)  # f -> t
+    ydir_tf = -y_to / a                # t -> f
 
     feat_ft = torch.stack([
         ydir_ft.real.to(rtype), ydir_ft.imag.to(rtype),
@@ -269,7 +271,12 @@ class GNSMsg_EdgeSelfAttn(nn.Module):
         d_model: int = None,
         n_heads: int = 4,
         num_attn_layers: int = 1,
-        attn_dropout: float = 0.0
+        attn_dropout: float = 0.0,
+        armijo_mode: str = "fixed",
+        armijo_rho: float = 0.5,
+        armijo_c1: float = 1e-4,
+        armijo_max_backtracks: int = 5,
+        armijo_min_alpha: float = 0.0625,
     ):
         super().__init__()
         self.K = K
@@ -279,6 +286,11 @@ class GNSMsg_EdgeSelfAttn(nn.Module):
         self.gamma = gamma
         self.v_limit = v_limit
         self.use_armijo = use_armijo
+        self.armijo_mode = armijo_mode
+        self.armijo_rho = armijo_rho
+        self.armijo_c1 = armijo_c1
+        self.armijo_max_backtracks = armijo_max_backtracks
+        self.armijo_min_alpha = armijo_min_alpha
 
         self.d_model = d_model if d_model is not None else d_hi
         self.n_heads = n_heads
@@ -380,6 +392,8 @@ class GNSMsg_EdgeSelfAttn(nn.Module):
                 Branch_status.squeeze(0),
                 Branch_tau.squeeze(0),
                 Branch_shift_deg.squeeze(0),
+                Branch_y_series_from.squeeze(0),
+                Branch_y_series_to.squeeze(0),
                 Branch_y_series_ft.squeeze(0),
                 Branch_y_shunt_from.squeeze(0),
                 Branch_y_shunt_to.squeeze(0),
@@ -399,6 +413,8 @@ class GNSMsg_EdgeSelfAttn(nn.Module):
                     Branch_status[b],
                     Branch_tau[b],
                     Branch_shift_deg[b],
+                    Branch_y_series_from[b],
+                    Branch_y_series_to[b],
                     Branch_y_series_ft[b],
                     Branch_y_shunt_from[b],
                     Branch_y_shunt_to[b],
@@ -469,28 +485,47 @@ class GNSMsg_EdgeSelfAttn(nn.Module):
                 with torch.no_grad():
                     F0 = _batched_mismatch_inf_norm(Y, v, th, P_set, Q_set, slack_mask, pv_mask)
 
-                alphas = v.new_tensor([1.0, 0.5, 0.25, 0.125, 0.0625])
-                T = int(alphas.numel())
+                max_backtracks = max(1, int(self.armijo_max_backtracks))
+                rho = min(max(float(self.armijo_rho), 1e-12), 1.0 - 1e-12)
+                c1 = float(self.armijo_c1)
+                min_alpha = max(0.0, float(self.armijo_min_alpha))
 
-                v_try = torch.clamp(v.unsqueeze(0) + alphas.view(T, 1, 1) * dv.unsqueeze(0), v_min, v_max)
-                th_try = (th.unsqueeze(0) + alphas.view(T, 1, 1) * dth.unsqueeze(0) + math.pi) % (2 * math.pi) - math.pi
-
-                with torch.no_grad():
-                    F_all = torch.stack([
-                        _batched_mismatch_inf_norm(Y, v_try[t], th_try[t], P_set, Q_set, slack_mask, pv_mask)
-                        for t in range(T)
-                    ])
-                    c1 = 1e-4
-                    cond = F_all <= (1.0 - c1 * alphas) * F0
-                    found = bool(cond.any())
-
-                if found:
-                    t_sel = int(torch.nonzero(cond, as_tuple=False)[0].item())
-                    a = float(alphas[t_sel])
-                    v = v_try[t_sel]
-                    th = th_try[t_sel]
-                    m = m + a * dm
+                if self.armijo_mode == "fixed":
+                    alphas = v.new_tensor([rho ** i for i in range(max_backtracks)])
+                    if min_alpha > 0.0:
+                        alphas = alphas[alphas >= min_alpha]
+                    if alphas.numel() == 0:
+                        alphas = v.new_tensor([min_alpha])
+                elif self.armijo_mode == "geometric":
+                    alphas = []
+                    a_tmp = 1.0
+                    for _ in range(max_backtracks):
+                        alphas.append(a_tmp)
+                        a_tmp *= rho
+                        if min_alpha > 0.0 and a_tmp < min_alpha:
+                            break
+                    alphas = v.new_tensor(alphas)
                 else:
+                    raise ValueError(f"Unknown armijo_mode={self.armijo_mode!r}; expected 'fixed' or 'geometric'.")
+
+                accepted = False
+                for a_tensor in alphas:
+                    a = float(a_tensor)
+                    v_try = torch.clamp(v + a * dv, v_min, v_max)
+                    th_try = (th + a * dth + math.pi) % (2 * math.pi) - math.pi
+
+                    with torch.no_grad():
+                        F_try = _batched_mismatch_inf_norm(Y, v_try, th_try, P_set, Q_set, slack_mask, pv_mask)
+                        ok = bool(F_try <= (1.0 - c1 * a) * F0)
+
+                    if ok:
+                        v = v_try
+                        th = th_try
+                        m = m + a * dm
+                        accepted = True
+                        break
+
+                if not accepted and self.armijo_mode == "fixed":
                     a = float(alphas[-1])
                     v2 = torch.clamp(v + a * dv, v_min, v_max)
                     th2 = (th + a * dth + math.pi) % (2 * math.pi) - math.pi

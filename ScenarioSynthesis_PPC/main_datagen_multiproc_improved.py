@@ -76,6 +76,25 @@ CASE_KWARGS = {
     # "case6515rte": {"ref_bus_idx": 6171},
 }
 
+
+def _case_label_from_source(preset: str, cgmes_path: str, case_name: str) -> str:
+    if preset:
+        return str(preset).strip()
+
+    if case_name:
+        return str(case_name).strip()
+
+    path = os.path.abspath(os.path.expanduser(str(cgmes_path).strip()))
+    if not path:
+        return "cgmes_case"
+
+    if os.path.isdir(path):
+        label = os.path.basename(path.rstrip(os.sep))
+    else:
+        label = os.path.splitext(os.path.basename(path))[0]
+
+    return label or "cgmes_case"
+
 SCENARIO_PRESETS = {
     "easy": dict(
         jitter_load=0.02,
@@ -312,25 +331,41 @@ def _generate_one_record_serialized() -> Dict[str, Any]:
     global _CFG, _RNG
 
     K = int(_CFG["K"])
-    preset = str(_CFG["preset"]).strip()
+    preset = str(_CFG.get("preset", "")).strip()
+    cgmes_path = str(_CFG.get("cgmes_path", "")).strip()
+    case_name_override = str(_CFG.get("case_name", "")).strip()
     ybus_mode = str(_CFG["ybus_mode"]).strip()
     save_y_matrix = bool(_CFG["save_y_matrix"])
     pu_nr = bool(_CFG["pu_nr"])
     start_mode = str(_CFG["start_mode"]).strip()
 
-    if not preset:
-        raise ValueError("This adapted script expects a pandapower preset in --preset.")
+    source_label = _case_label_from_source(preset, cgmes_path, case_name_override)
 
-    case_fn = getattr(pn, preset, None)
-    if case_fn is None:
-        raise ValueError(f"Unknown pandapower case preset: {preset}")
+    if preset:
+        case_fn = getattr(pn, preset, None)
+        if case_fn is None:
+            raise ValueError(f"Unknown pandapower case preset: {preset}")
+        case_kwargs = CASE_KWARGS.get(preset, {}).copy()
+    elif cgmes_path:
+        case_fn = {
+            "cgmes_files": cgmes_path,
+            "case_name": source_label,
+            "converter_kwargs": {
+                "cgmes_version": str(_CFG["cgmes_version"]).strip(),
+                "ignore_errors": bool(_CFG["cgmes_ignore_errors"]),
+            },
+        }
+        case_kwargs = {}
+    else:
+        raise ValueError("Provide either --preset or --cgmes_path.")
 
-    force_branch_shunt_pu = _build_force_branch_shunt_from_cfg(preset, _CFG)
+    force_branch_shunt_pu = _build_force_branch_shunt_from_cfg(source_label, _CFG)
     sample_seed = int(_RNG.integers(0, 2**32 - 1, dtype=np.uint32))
 
     gen_kwargs = dict(
         case_fn=case_fn,
-        case_kwargs=CASE_KWARGS.get(preset, {}).copy(),
+        case_kwargs=case_kwargs,
+        cgmes_model_a_cleanup=bool(_CFG.get("cgmes_model_a_cleanup", False)),
         seed=sample_seed,
         jitter_load=float(_CFG["jitter_load"]),
         jitter_gen=float(_CFG["jitter_gen"]),
@@ -483,16 +518,62 @@ def _generate_batch(n_rows: int) -> List[Dict[str, Any]]:
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Parallel dataset generation for pandapower test cases (branch-row direct-SI metadata)."
+        description="Parallel dataset generation for pandapower and CGMES cases (branch-row direct-SI metadata)."
     )
 
-    parser.add_argument(
+    source_group = parser.add_mutually_exclusive_group(required=True)
+    source_group.add_argument(
         "--preset",
         type=str,
-        required=True,
         choices=CASES,
         help="Pandapower test case name.",
     )
+    source_group.add_argument(
+        "--cgmes_path",
+        type=str,
+        default="",
+        help="Path to a CGMES zip file or to a directory containing CGMES zip files.",
+    )
+    parser.add_argument(
+        "--case_name",
+        type=str,
+        default="",
+        help="Optional case label override, especially useful with --cgmes_path.",
+    )
+    parser.add_argument(
+        "--cgmes_version",
+        type=str,
+        default="2.4.15",
+        help="CGMES version passed to pandapower when --cgmes_path is used.",
+    )
+    cgmes_cleanup_group = parser.add_mutually_exclusive_group()
+    cgmes_cleanup_group.add_argument(
+        "--cgmes_model_a_cleanup",
+        dest="cgmes_model_a_cleanup",
+        action="store_true",
+        help="Apply LVN-style CGMES cleanup before PPC compilation.",
+    )
+    cgmes_cleanup_group.add_argument(
+        "--no_cgmes_model_a_cleanup",
+        dest="cgmes_model_a_cleanup",
+        action="store_false",
+        help="Do not apply LVN-style CGMES cleanup (default).",
+    )
+    parser.set_defaults(cgmes_model_a_cleanup=False)
+    cgmes_error_group = parser.add_mutually_exclusive_group()
+    cgmes_error_group.add_argument(
+        "--cgmes_ignore_errors",
+        dest="cgmes_ignore_errors",
+        action="store_true",
+        help="Ignore CGMES converter errors when loading the source (default).",
+    )
+    cgmes_error_group.add_argument(
+        "--no_cgmes_ignore_errors",
+        dest="cgmes_ignore_errors",
+        action="store_false",
+        help="Do not ignore CGMES converter errors when loading the source.",
+    )
+    parser.set_defaults(cgmes_ignore_errors=True)
     parser.add_argument(
         "--ybus_mode",
         type=str,
@@ -563,8 +644,13 @@ def parse_args():
 def build_output_filename(args) -> str:
     mode = str(args.ybus_mode).strip()
     nr_unit = "puNR" if args.pu_nr else "siNR"
+    case_label = _case_label_from_source(
+        preset=str(args.preset or "").strip(),
+        cgmes_path=str(args.cgmes_path or "").strip(),
+        case_name=str(args.case_name or "").strip(),
+    )
     name = (
-        f"{args.preset}_{mode}_{args.scenario_level}_{args.start_mode}_"
+        f"{case_label}_{mode}_{args.scenario_level}_{args.start_mode}_"
         f"{nr_unit}_{args.runs}_NR_branchrows_directSI.parquet"
     )
     return os.path.join(args.save_path, name)
@@ -582,6 +668,11 @@ def main():
     args = parse_args()
 
     scenario_cfg = SCENARIO_PRESETS[args.scenario_level]
+    source_label = _case_label_from_source(
+        preset=str(args.preset or "").strip(),
+        cgmes_path=str(args.cgmes_path or "").strip(),
+        case_name=str(args.case_name or "").strip(),
+    )
 
     workers = args.workers if args.workers and args.workers > 0 else (os.cpu_count() or 1)
     runs = int(args.runs)
@@ -593,7 +684,12 @@ def main():
     print(f"[INFO] Output file: {filename}")
 
     cfg = dict(
-        preset=str(args.preset).strip(),
+        preset=str(args.preset or "").strip(),
+        cgmes_path=str(args.cgmes_path or "").strip(),
+        case_name=str(args.case_name or "").strip(),
+        cgmes_version=str(args.cgmes_version).strip(),
+        cgmes_model_a_cleanup=bool(args.cgmes_model_a_cleanup),
+        cgmes_ignore_errors=bool(args.cgmes_ignore_errors),
         ybus_mode=str(args.ybus_mode).strip(),
         K=int(args.K),
         save_y_matrix=save_y_matrix,
@@ -643,7 +739,13 @@ def main():
     )
 
     print("[INFO] Configuration")
+    print(f"  source_label              = {source_label}")
     print(f"  preset                    = {args.preset}")
+    print(f"  cgmes_path                = {args.cgmes_path}")
+    print(f"  case_name                 = {args.case_name}")
+    print(f"  cgmes_version             = {args.cgmes_version}")
+    print(f"  cgmes_model_a_cleanup     = {args.cgmes_model_a_cleanup}")
+    print(f"  cgmes_ignore_errors       = {args.cgmes_ignore_errors}")
     print(f"  ybus_mode                 = {args.ybus_mode}")
     print(f"  scenario_level            = {args.scenario_level}")
     print(f"  scenario_cfg              = {scenario_cfg}")

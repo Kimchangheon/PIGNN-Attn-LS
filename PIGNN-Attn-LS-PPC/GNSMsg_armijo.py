@@ -70,10 +70,10 @@ def _build_dense_Y_from_branchrows_single(
     Y_shunt_bus: torch.Tensor,
 ) -> torch.Tensor:
     """
-    Direct-SI dense Ybus reconstruction from one metadata row per PPC branch row.
+    Dense Ybus reconstruction from one metadata row per PPC branch row.
     """
     device = Branch_f_bus.device
-    dtype = Branch_y_series_ft.dtype
+    dtype = Branch_y_series_from.dtype
 
     Y = torch.zeros(N, N, dtype=dtype, device=device)
     Y.diagonal().add_(Y_shunt_bus.to(dtype))
@@ -92,14 +92,13 @@ def _build_dense_Y_from_branchrows_single(
 
     y_from = Branch_y_series_from[mask].to(dtype)
     y_to   = Branch_y_series_to[mask].to(dtype)
-    y_ft   = Branch_y_series_ft[mask].to(dtype)
     ysh_f  = Branch_y_shunt_from[mask].to(dtype)
     ysh_t  = Branch_y_shunt_to[mask].to(dtype)
 
     Yff = (y_from + ysh_f / 2.0) / (a * torch.conj(a))
     Ytt = (y_to   + ysh_t / 2.0)
-    Yft = -y_ft / torch.conj(a)
-    Ytf = -y_ft / a
+    Yft = -y_from / torch.conj(a)
+    Ytf = -y_to / a
 
     Y.index_put_((f, f), Yff, accumulate=True)
     Y.index_put_((t, t), Ytt, accumulate=True)
@@ -115,6 +114,8 @@ def _build_directed_edges_single(
     Branch_status: torch.Tensor,
     Branch_tau: torch.Tensor,
     Branch_shift_deg: torch.Tensor,
+    Branch_y_series_from: torch.Tensor,
+    Branch_y_series_to: torch.Tensor,
     Branch_y_series_ft: torch.Tensor,
     Branch_y_shunt_from: torch.Tensor,
     Branch_y_shunt_to: torch.Tensor,
@@ -130,7 +131,7 @@ def _build_directed_edges_single(
        tau, theta_rad, is_trafo]
     """
     device = Branch_f_bus.device
-    ctype = Branch_y_series_ft.dtype
+    ctype = Branch_y_series_from.dtype
     rtype = Branch_tau.dtype
 
     mask = (Branch_status != 0)
@@ -149,12 +150,13 @@ def _build_directed_edges_single(
 
     a = tau.to(ctype) * torch.exp(1j * theta.to(ctype))
 
-    y_ft = Branch_y_series_ft[mask].to(ctype)
+    y_from = Branch_y_series_from[mask].to(ctype)
+    y_to = Branch_y_series_to[mask].to(ctype)
     ysh_f = Branch_y_shunt_from[mask].to(ctype)
     ysh_t = Branch_y_shunt_to[mask].to(ctype)
 
-    ydir_ft = -y_ft / torch.conj(a)   # f -> t
-    ydir_tf = -y_ft / a               # t -> f
+    ydir_ft = -y_from / torch.conj(a)   # f -> t
+    ydir_tf = -y_to / a                 # t -> f
 
     feat_ft = torch.stack([
         ydir_ft.real.to(rtype), ydir_ft.imag.to(rtype),
@@ -293,6 +295,8 @@ class GNSMsg(nn.Module):
                 Branch_status.squeeze(0),
                 Branch_tau.squeeze(0),
                 Branch_shift_deg.squeeze(0),
+                Branch_y_series_from.squeeze(0),
+                Branch_y_series_to.squeeze(0),
                 Branch_y_series_ft.squeeze(0),
                 Branch_y_shunt_from.squeeze(0),
                 Branch_y_shunt_to.squeeze(0),
@@ -312,6 +316,8 @@ class GNSMsg(nn.Module):
                     Branch_status[b],
                     Branch_tau[b],
                     Branch_shift_deg[b],
+                    Branch_y_series_from[b],
+                    Branch_y_series_to[b],
                     Branch_y_series_ft[b],
                     Branch_y_shunt_from[b],
                     Branch_y_shunt_to[b],

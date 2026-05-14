@@ -33,6 +33,14 @@ def _optional_branch_indices():
     except Exception:
         BR_G = None
     try:
+        from pandapower.pypower.idx_brch import BR_R_ASYM
+    except Exception:
+        BR_R_ASYM = None
+    try:
+        from pandapower.pypower.idx_brch import BR_X_ASYM
+    except Exception:
+        BR_X_ASYM = None
+    try:
         from pandapower.pypower.idx_brch import BR_B_ASYM
     except Exception:
         BR_B_ASYM = None
@@ -40,7 +48,7 @@ def _optional_branch_indices():
         from pandapower.pypower.idx_brch import BR_G_ASYM
     except Exception:
         BR_G_ASYM = None
-    return BR_G, BR_B_ASYM, BR_G_ASYM
+    return BR_G, BR_R_ASYM, BR_X_ASYM, BR_B_ASYM, BR_G_ASYM
 
 
 def _col(row: np.ndarray, idx, default=0.0) -> float:
@@ -56,12 +64,41 @@ def _looks_like_pandapower_net(obj) -> bool:
     return hasattr(obj, "bus") and hasattr(obj, "__getitem__")
 
 
+def _looks_like_cgmes_source(case_fn: CaseSource) -> bool:
+    """
+    Heuristic used to decide whether Model-A CGMES cleanup should be applied.
+    """
+    if isinstance(case_fn, dict):
+        return "cgmes_files" in case_fn
+
+    if isinstance(case_fn, (list, tuple)):
+        return True
+
+    if isinstance(case_fn, (str, os.PathLike)):
+        expanded = os.path.abspath(os.path.expanduser(str(case_fn)))
+        return os.path.exists(expanded)
+
+    return False
+
+
 def _dense_ybus_from_ppc_internal(ppc_int) -> np.ndarray:
     """Safely extract dense Ybus from ppc internal dict."""
     Y = ppc_int["Ybus"]
     if hasattr(Y, "toarray"):
         return Y.toarray().astype(np.complex128)
     return np.asarray(Y, dtype=np.complex128)
+
+
+def _get_baseMVA_from_ppc(ppc_obj, fallback=None) -> float:
+    """
+    Read baseMVA from a PPC-like dict.
+    Some pandapower versions keep baseMVA only on net._ppc, not on net._ppc["internal"].
+    """
+    if isinstance(ppc_obj, dict) and "baseMVA" in ppc_obj:
+        return float(ppc_obj["baseMVA"])
+    if fallback is not None:
+        return float(fallback)
+    raise KeyError("baseMVA")
 
 
 def _cgmes_from_files(file_list, converter_kwargs: Optional[Dict[str, Any]] = None):
@@ -113,6 +150,71 @@ def _default_case_name_from_files(files):
         return os.path.splitext(os.path.basename(files[0]))[0]
     parent = os.path.basename(os.path.dirname(files[0]))
     return parent if parent else "cgmes_case"
+
+
+def _apply_model_a_cgmes_cleanup(net) -> None:
+    """
+    Apply the same practical cleanup that was validated for the LVN CGMES Model A flow:
+      - disable unsupplied buses
+      - disable zero-impedance lines
+      - clamp suspicious generator voltage setpoints
+    """
+    from pandapower.topology import unsupplied_buses
+
+    try:
+        isolated = unsupplied_buses(net)
+    except Exception:
+        isolated = set()
+
+    if len(isolated) > 0 and hasattr(net, "bus") and "in_service" in net.bus.columns:
+        net.bus.loc[list(isolated), "in_service"] = False
+
+    if (
+        hasattr(net, "line")
+        and len(net.line) > 0
+        and all(c in net.line.columns for c in ["r_ohm_per_km", "x_ohm_per_km", "in_service"])
+    ):
+        zero_imp_mask = (
+            (net.line["r_ohm_per_km"] == 0) &
+            (net.line["x_ohm_per_km"] == 0)
+        )
+        if zero_imp_mask.any():
+            net.line.loc[zero_imp_mask, "in_service"] = False
+
+    if (
+        hasattr(net, "gen")
+        and len(net.gen) > 0
+        and "vm_pu" in net.gen.columns
+    ):
+        bad_vm = (net.gen["vm_pu"] < 0.8) | (net.gen["vm_pu"] > 1.2)
+        if bad_vm.any():
+            net.gen.loc[bad_vm, "vm_pu"] = 1.0
+
+
+def _has_conflicting_voltage_controllers(net) -> bool:
+    """
+    Return True if multiple voltage-controlling elements share a bus.
+    In such cases, random independent vm_pu jitter can make the case inconsistent.
+    """
+    ctrl_buses = []
+
+    if hasattr(net, "ext_grid") and len(net.ext_grid) > 0 and "bus" in net.ext_grid.columns:
+        ext = net.ext_grid
+        if "in_service" in ext.columns:
+            ext = ext[ext["in_service"]]
+        ctrl_buses.extend(ext["bus"].to_list())
+
+    if hasattr(net, "gen") and len(net.gen) > 0 and "bus" in net.gen.columns:
+        gen = net.gen
+        if "in_service" in gen.columns:
+            gen = gen[gen["in_service"]]
+        ctrl_buses.extend(gen["bus"].to_list())
+
+    if not ctrl_buses:
+        return False
+
+    buses = np.asarray(ctrl_buses, dtype=np.int64)
+    return np.unique(buses).size != buses.size
 
 
 def _build_net_from_source(case_fn: CaseSource, case_kwargs: Optional[Dict[str, Any]] = None):
@@ -199,7 +301,7 @@ def per_unit_to_SI(Y_pu: np.ndarray, ppc_int) -> np.ndarray:
     from pandapower.pypower.idx_bus import BASE_KV
 
     bus = np.asarray(ppc_int["bus"], dtype=float)
-    baseMVA = float(ppc_int["baseMVA"])
+    baseMVA = _get_baseMVA_from_ppc(ppc_int)
 
     vn_kv = bus[:, BASE_KV].astype(float)
     Vbase = vn_kv * 1e3
@@ -214,6 +316,8 @@ def build_Y_stamped_from_ppc(ppc_int):
 
     Matches pandapower's extended PPC branch model when available:
       - BR_G
+      - BR_R_ASYM
+      - BR_X_ASYM
       - BR_B_ASYM
       - BR_G_ASYM
     """
@@ -222,11 +326,11 @@ def build_Y_stamped_from_ppc(ppc_int):
         F_BUS, T_BUS, BR_R, BR_X, BR_B, TAP, SHIFT, BR_STATUS
     )
 
-    BR_G, BR_B_ASYM, BR_G_ASYM = _optional_branch_indices()
+    BR_G, BR_R_ASYM, BR_X_ASYM, BR_B_ASYM, BR_G_ASYM = _optional_branch_indices()
 
     bus = np.asarray(ppc_int["bus"], dtype=float)
     branch = np.asarray(ppc_int["branch"], dtype=float)
-    baseMVA = float(ppc_int["baseMVA"])
+    baseMVA = _get_baseMVA_from_ppc(ppc_int)
 
     nb = bus.shape[0]
     nl = branch.shape[0]
@@ -234,13 +338,29 @@ def build_Y_stamped_from_ppc(ppc_int):
 
     stat = branch[:, BR_STATUS]
 
-    # series admittance
+    # series admittance. Pandapower allows asymmetric to-side impedance:
+    # Ysf = 1 / (R + jX), Yst = 1 / (R + R_ASYM + j(X + X_ASYM)).
     R = branch[:, BR_R]
     X = branch[:, BR_X]
-    Z = R + 1j * X
-    Ys = np.zeros(nl, dtype=np.complex128)
-    nz = (stat != 0) & (np.abs(Z) > 1e-18)
-    Ys[nz] = stat[nz] / Z[nz]
+    if BR_R_ASYM is not None and BR_R_ASYM < branch.shape[1]:
+        R_asym = branch[:, BR_R_ASYM]
+    else:
+        R_asym = np.zeros(nl, dtype=float)
+    if BR_X_ASYM is not None and BR_X_ASYM < branch.shape[1]:
+        X_asym = branch[:, BR_X_ASYM]
+    else:
+        X_asym = np.zeros(nl, dtype=float)
+
+    Zf = R + 1j * X
+    Zt = (R + R_asym) + 1j * (X + X_asym)
+
+    Ysf = np.zeros(nl, dtype=np.complex128)
+    nz_f = (stat != 0) & (np.abs(Zf) > 1e-18)
+    Ysf[nz_f] = stat[nz_f] / Zf[nz_f]
+
+    Yst = np.zeros(nl, dtype=np.complex128)
+    nz_t = (stat != 0) & (np.abs(Zt) > 1e-18)
+    Yst[nz_t] = stat[nz_t] / Zt[nz_t]
 
     # tap + phase shift
     tap = np.ones(nl, dtype=np.complex128)
@@ -273,10 +393,10 @@ def build_Y_stamped_from_ppc(ppc_int):
     Bct = ((G + G_asym) + 1j * (B + B_asym))
 
     # branch stamps in pu
-    Yff = (Ys + Bcf / 2.0) / (tap * np.conj(tap))
-    Ytt = Ys + Bct / 2.0
-    Yft = -Ys / np.conj(tap)
-    Ytf = -Ys / tap
+    Yff = (Ysf + Bcf / 2.0) / (tap * np.conj(tap))
+    Ytt = Yst + Bct / 2.0
+    Yft = -Ysf / np.conj(tap)
+    Ytf = -Yst / tap
 
     f_bus = branch[:, F_BUS].astype(int)
     t_bus = branch[:, T_BUS].astype(int)
@@ -284,7 +404,12 @@ def build_Y_stamped_from_ppc(ppc_int):
     for k in range(nl):
         if stat[k] == 0:
             continue
-        if (abs(Ys[k]) < 1e-18) and (abs(Bcf[k]) < 1e-18) and (abs(Bct[k]) < 1e-18):
+        if (
+            (abs(Ysf[k]) < 1e-18)
+            and (abs(Yst[k]) < 1e-18)
+            and (abs(Bcf[k]) < 1e-18)
+            and (abs(Bct[k]) < 1e-18)
+        ):
             continue
 
         f = f_bus[k]
@@ -415,6 +540,7 @@ def case_generation_pandapower(
     case_kwargs: Optional[Dict[str, Any]] = None,
     *,
     ybus_mode: str = "ppcY",   # "ppcY" or "stamped"
+    cgmes_model_a_cleanup: bool = False,
     seed=None,
     jitter_load: float = 0.0,
     jitter_gen: float = 0.0,
@@ -481,7 +607,7 @@ def case_generation_pandapower(
         F_BUS, T_BUS, BR_R, BR_X, BR_B, TAP, SHIFT, BR_STATUS
     )
 
-    BR_G, BR_B_ASYM, BR_G_ASYM = _optional_branch_indices()
+    BR_G, BR_R_ASYM, BR_X_ASYM, BR_B_ASYM, BR_G_ASYM = _optional_branch_indices()
 
     valid_start_modes = {"auto", "manual_flat", "ppc_v0", "dc_compile"}
     if start_mode not in valid_start_modes:
@@ -494,6 +620,9 @@ def case_generation_pandapower(
     # 1) Build network from generalized source
     # ------------------------------------------------------------
     net, case_name = _build_net_from_source(case_fn, case_kwargs=case_kwargs)
+
+    if cgmes_model_a_cleanup and _looks_like_cgmes_source(case_fn):
+        _apply_model_a_cgmes_cleanup(net)
 
     # optional transformer magnetizing params
     if hasattr(net, "trafo") and net.trafo is not None and len(net.trafo):
@@ -514,14 +643,18 @@ def case_generation_pandapower(
         net.gen["p_mw"] = net.gen["p_mw"].to_numpy(float) * s
 
     # optional PV voltage-setpoint jitter
-    # Disable it for GB cases, because they can have multiple voltage-controlling
-    # elements on the same bus and random independent vm_pu values can make the
-    # case internally inconsistent.
+    # Disable it for cases with conflicting voltage controllers, because multiple
+    # voltage-controlling elements on the same bus with different random vm_pu
+    # values can make the compiled case internally inconsistent.
     DISABLE_PV_JITTER_CASES = {"GBnetwork", "GBreducednetwork"}
+    disable_pv_jitter = (
+        case_name in DISABLE_PV_JITTER_CASES
+        or _has_conflicting_voltage_controllers(net)
+    )
 
     if (
         pv_vset_range is not None
-        and case_name not in DISABLE_PV_JITTER_CASES
+        and not disable_pv_jitter
         and hasattr(net, "gen")
         and len(net.gen)
     ):
@@ -553,7 +686,11 @@ def case_generation_pandapower(
         )
 
     ppc_int = net._ppc["internal"]
-    baseMVA = float(ppc_int["baseMVA"])
+    baseMVA = _get_baseMVA_from_ppc(ppc_int, fallback=net._ppc.get("baseMVA"))
+
+    if "baseMVA" not in ppc_int:
+        ppc_int = dict(ppc_int)
+        ppc_int["baseMVA"] = baseMVA
 
     bus_ppc = np.asarray(ppc_int["bus"], dtype=float)
     branch_ppc = np.asarray(ppc_int["branch"], dtype=float)
@@ -719,6 +856,8 @@ def case_generation_pandapower(
         stat = float(row[BR_STATUS])
         r = float(row[BR_R])
         x = float(row[BR_X])
+        r_asym = _col(row, BR_R_ASYM, 0.0)
+        x_asym = _col(row, BR_X_ASYM, 0.0)
 
         b = stat * float(row[BR_B])
         g = stat * _col(row, BR_G, 0.0)
@@ -744,12 +883,14 @@ def case_generation_pandapower(
         is_tr = (abs(tau - 1.0) > 1e-12) or (abs(shift) > 1e-12) or (abs(Vf - Vt) > 1e-6)
         Is_trafo[k] = 1 if is_tr else 0
 
-        z = complex(r, x)
-        Ys_pu = 0j if (stat == 0.0 or abs(z) < 1e-12) else (stat / z)
+        z_from = complex(r, x)
+        z_to = complex(r + r_asym, x + x_asym)
+        Ysf_pu = 0j if (stat == 0.0 or abs(z_from) < 1e-12) else (stat / z_from)
+        Yst_pu = 0j if (stat == 0.0 or abs(z_to) < 1e-12) else (stat / z_to)
 
-        Branch_y_series_from[k] = Ys_pu * (S_base / (Vf ** 2))
-        Branch_y_series_to[k] = Ys_pu * (S_base / (Vt ** 2))
-        Branch_y_series_ft[k] = Ys_pu * (S_base / (Vf * Vt))
+        Branch_y_series_from[k] = Ysf_pu * (S_base / (Vf ** 2))
+        Branch_y_series_to[k] = Yst_pu * (S_base / (Vt ** 2))
+        Branch_y_series_ft[k] = Ysf_pu * (S_base / (Vf * Vt))
 
         Bcf_pu = (g + 1j * b)
         Bct_pu = ((g + g_asym) + 1j * (b + b_asym))
@@ -813,6 +954,7 @@ def reconstruct_Y_pandapower_branchrows_direct_SI(
     Branch_y_shunt_from: np.ndarray,
     Branch_y_shunt_to: np.ndarray,
     Y_shunt_bus: np.ndarray,
+    Vbase_bus: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     """
     Reconstruct Ybus directly in SI, using ONE metadata row per PPC branch row.
@@ -821,10 +963,14 @@ def reconstruct_Y_pandapower_branchrows_direct_SI(
       Yff = (y_from + ysh_from/2) / |a|^2
       Ytt =  y_to   + ysh_to/2
       Yft = -y_ft / conj(a)
-      Ytf = -y_ft / a
+      Ytf = -y_tf / a
 
     where:
       a = tau * exp(j*theta)
+
+    If Vbase_bus is supplied, asymmetric series impedances are represented exactly
+    by deriving the SI cross-base terms from y_from and y_to. Without Vbase_bus,
+    Ytf falls back to the legacy symmetric Branch_y_series_ft approximation.
     """
     N = int(N)
     nl = len(Branch_f_bus)
@@ -846,13 +992,21 @@ def reconstruct_Y_pandapower_branchrows_direct_SI(
         y_from = complex(Branch_y_series_from[k])
         y_to = complex(Branch_y_series_to[k])
         y_ft = complex(Branch_y_series_ft[k])
+        y_tf = y_ft
         ysh_f = complex(Branch_y_shunt_from[k])
         ysh_t = complex(Branch_y_shunt_to[k])
+
+        if Vbase_bus is not None:
+            Vf = float(Vbase_bus[f])
+            Vt = float(Vbase_bus[t])
+            if Vf > 0.0 and Vt > 0.0:
+                y_ft = y_from * (Vf / Vt)
+                y_tf = y_to * (Vt / Vf)
 
         Yff = (y_from + ysh_f / 2.0) / (a * np.conj(a))
         Ytt = (y_to + ysh_t / 2.0)
         Yft = -y_ft / np.conj(a)
-        Ytf = -y_ft / a
+        Ytf = -y_tf / a
 
         Y_SI[f, f] += Yff
         Y_SI[t, t] += Ytt

@@ -46,6 +46,11 @@ parser.add_argument("--n_heads", type=int, default=4)
 parser.add_argument("--K", type=int, default=40)
 parser.add_argument('--gamma', type=float, default=0.9)
 parser.add_argument("--use_armijo", action="store_true")
+parser.add_argument("--armijo_mode", type=str, default="fixed", choices=("fixed", "geometric"))
+parser.add_argument("--armijo_rho", type=float, default=0.5)
+parser.add_argument("--armijo_c1", type=float, default=1e-4)
+parser.add_argument("--armijo_max_backtracks", type=int, default=5)
+parser.add_argument("--armijo_min_alpha", type=float, default=0.0625)
 parser.add_argument("--vlimit", action="store_true")
 parser.add_argument('--DthetaMax', type=float, default=0.3)
 parser.add_argument('--DvmFrac', type=float, default=0.1)
@@ -71,6 +76,17 @@ parser.add_argument(
     "--no_cach_dense_ybus",
     action="store_true",
     help="Do not precompute/store dense Ybus in the dataset; reconstruct it inside the model instead",
+)
+parser.add_argument(
+    "--lazy_parquet",
+    action="store_true",
+    help="Load parquet lazily by row group instead of materializing the full dataset in memory",
+)
+parser.add_argument(
+    "--row_group_cache_size",
+    type=int,
+    default=2,
+    help="How many decoded parquet row groups to keep in RAM when --lazy_parquet is enabled",
 )
 
 # NEW
@@ -177,7 +193,8 @@ if args.log_to_file:
 print(
     f"MODEL:{MODEL}, PINN:{PINN}, Block:{BLOCK_DIAG}, d:{d}, d_hi:{d_hi}, n_heads:{n_heads}, "
     f"K:{K}, Runname:{RUNNAME}, PARQUET:{PARQUET}, BATCH:{BATCH}, EP:{EPOCHS}, LR:{LR}, "
-    f"no_cache_dense_ybus:{args.no_cache_dense_ybus}"
+    f"no_cache_dense_ybus:{args.no_cache_dense_ybus}, lazy_parquet:{args.lazy_parquet}, "
+    f"row_group_cache_size:{args.row_group_cache_size}"
 )
 
 
@@ -196,6 +213,8 @@ full_ds = ChanghunDataset(
     per_unit=PER_UNIT,
     device=None,
     no_cache_dense_ybus=args.no_cache_dense_ybus,
+    lazy_row_groups=args.lazy_parquet,
+    row_group_cache_size=args.row_group_cache_size,
 )
 
 n_total = len(full_ds)
@@ -239,15 +258,15 @@ else:
         # Non-blockdiag batching requires homogeneous tensor shapes.
         # With the new parquet metadata that means at least same (N, nl).
         train_signatures = [
-            (full_ds[i]["N"], full_ds[i]["nl"])
+            full_ds.get_signature(i) if hasattr(full_ds, "get_signature") else (full_ds[i]["N"], full_ds[i]["nl"])
             for i in train_ds.indices
         ]
         val_signatures = [
-            (full_ds[i]["N"], full_ds[i]["nl"])
+            full_ds.get_signature(i) if hasattr(full_ds, "get_signature") else (full_ds[i]["N"], full_ds[i]["nl"])
             for i in val_ds.indices
         ]
         test_signatures = [
-            (full_ds[i]["N"], full_ds[i]["nl"])
+            full_ds.get_signature(i) if hasattr(full_ds, "get_signature") else (full_ds[i]["N"], full_ds[i]["nl"])
             for i in test_ds.indices
         ]
 
@@ -300,7 +319,12 @@ elif args.model == "GNSMsg_EdgeSelfAttn":
         gamma=GAMMA,
         v_limit=VLIMIT,
         use_armijo=args.use_armijo,
-        num_attn_layers=args.num_attn_layers
+        num_attn_layers=args.num_attn_layers,
+        armijo_mode=args.armijo_mode,
+        armijo_rho=args.armijo_rho,
+        armijo_c1=args.armijo_c1,
+        armijo_max_backtracks=args.armijo_max_backtracks,
+        armijo_min_alpha=args.armijo_min_alpha,
     ).to(device)
 
 else:
@@ -389,14 +413,13 @@ def build_dense_y_from_branchrows_single(
 
     y_from = Branch_y_series_from[mask].to(dtype)
     y_to = Branch_y_series_to[mask].to(dtype)
-    y_ft = Branch_y_series_ft[mask].to(dtype)
     ysh_f = Branch_y_shunt_from[mask].to(dtype)
     ysh_t = Branch_y_shunt_to[mask].to(dtype)
 
     Yff = (y_from + ysh_f / 2.0) / (a * torch.conj(a))
     Ytt = (y_to + ysh_t / 2.0)
-    Yft = -y_ft / torch.conj(a)
-    Ytf = -y_ft / a
+    Yft = -y_from / torch.conj(a)
+    Ytf = -y_to / a
 
     Y.index_put_((f, f), Yff, accumulate=True)
     Y.index_put_((t, t), Ytt, accumulate=True)

@@ -36,5 +36,5 @@ srun python main_datagen_multiproc_improved.py \
   --start_mode dc_compile \
   --diagnose_nr \
   --convergence_mode misinf \
-  --save_path ./out \
+  --save_path /home/vault/iwi5/iwi5295h/PIGNN-Attn-LS/ScenarioSynthesis_PPC/out \
   --overwrite

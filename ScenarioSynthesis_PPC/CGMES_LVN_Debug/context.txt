@@ -1,0 +1,1973 @@
+my colleague actually figured out what is the problem. please explain his message in a clear words.
+
+The load-flow calculation for the LVN CGMES works for me using Panda Power.
+
+The lines that have been set to zero are located in an area where it seems something has also been deleted. The first line could not be found in any map, but is still available in PowerFactory. I suspect this is something that LVN wants to keep secret, but which is now causing us problems.
+
+In PowerFactory, these are unenergized
+
+I can actually find the other line
+
+however unsupplied
+
+and bothline have no values:
+
+The insulated buses seem to fit
+
+same for the loads
+
+So, fundamentally, there are two differences in the Y-bus matrix compared to this model. We could group these together as a bus branch. This simplifies things somewhat, or we could model them as individual with in the ""Sammelschinen" – which is relatively complicated – and then define each connection
+
+looks good for
+CNN_121K_E_20325_4, CNN_2Z_E_5490_12, CNN_168F_E_29689_8, CNN_UW-Westtirol_D_19819_29
+
+different for
+CNN_F675B_J_29025_7, CNN_113F_J_21809_15, CNN_629_J_19740_37, CNN_67001.126 A11A grün_E_19633_
+
+An important feature of the Y-bus matrix in panda power is that PD2PPC simplifies direct connections between switches.:
+
+https://github.com/e2nIEE/pandapower/blob/develop/tutorials/internal_datastructure.ipynb
+"""
+Mapping the Buses
+The pandapower indices are not equal to the ppc indices for several reasons. Some buses are fused together in case of closed bus-bus switches and auxiliary buses are created for elements like extended wards or three winding transformers. See here for more details: https://pandapower.readthedocs.io/en/latest/elements/switch.html
+""""
+
+i guess in your case we need to avoid this, to be able zu change topologie faster, f,e, by adapting a y bus matrix with all switchstates to the situation
+
+As I mentioned earlier, the problem with Pandapower is that it always merges _pd2ppc buses that are connected via closed switches. This means that every time you flip a switch, you have to rebuild the entire Y-bus from scratch – which is slow when, for example, we want to calculate thousands of varrains using Gnn.
+
+To get round this, I have split the Y-bus into two parts:
+
+
+   Y_total = Y_static + Y_switches
+
+Y_static contains everything that never changes – cables, transformers, etc. This is constructed once using pandapower’s own models (just to avoid own implementations) and then remains unchanged.
+
+
+Y_switches contains only the switches. An open switch = no continuity. A closed switch = very low impedance, so that the matrix does not become singular.
+
+
+If you want to change the topology, you simply rebuild Y_switches – it’s just a small sparse matrix and takes around 130 ms, rather than rebuilding everything from scratch.
+
+somethink like: Ybus = get_Ybus_nb(switch_states)
+
+
+The code result two y bus matrixs :
+- Bus-Branch (722x722): pandapower’s standard model, in which closed switches merge buses – good for power flow
+- Node-Breaker (3798x3798): Each connection node from the CGMES file is its own row/column, switches are explicit – good for quick topology changes
+- test if Node-Breaker (3798x3798) matrix with the setting of the switches and _pd2ppc gets down to 722*722...however looks good.
+
+I'm curious to see how this will affect the GNN pipeline
+
+
+Yes — your colleague’s message is actually very important, and it changes the story quite a lot.
+
+In simple words, he is saying:
+
+## Main conclusion
+
+**The CGMES itself is not fundamentally broken.**
+He can make the **LVN CGMES load flow converge in pandapower**.
+
+So the real issue is probably **not** “pandapower cannot solve this network at all.”
+
+The issue is more likely about **how the network is represented for Y-bus construction and topology handling**, especially around:
+
+* zero-parameter lines
+* unsupplied / unenergized areas
+* switch-connected buses
+* pandapower’s `_pd2ppc` bus fusion
+
+---
+
+## What he means, step by step
+
+### 1. The zero-valued lines are in a strange area
+
+He says the lines that were set to zero are in a region where something seems to have been removed or hidden.
+
+That means:
+
+* there are lines in the model with essentially **0 impedance values**
+* one of them is still present in PowerFactory but not really visible on the map
+* the other can be found, but it is in an **unsupplied / dead** area
+* both lines have no electrical values
+
+So his interpretation is:
+
+> these lines are probably not normal physical lines for actual energized power transfer
+
+They may be:
+
+* placeholder connections
+* internal busbar couplers
+* hidden / redacted assets
+* topology-only connectors
+* modeling artifacts in a confidential area
+
+So these objects are disturbing your import / Y-bus interpretation.
+
+---
+
+### 2. In PowerFactory those parts are unenergized
+
+This is also important.
+
+He says those lines are **unenergized** in PowerFactory.
+
+That means they exist in the data model, but operationally they are not active supply paths.
+
+So if your pipeline treats them as normal active branches, that can distort the topology.
+
+---
+
+### 3. The isolated buses and loads look correct
+
+He says:
+
+* the insulated / isolated buses seem to match
+* the loads also seem to match
+
+So he is basically saying:
+
+> the problem is not that loads are attached wrongly everywhere
+> and not that isolated buses are completely misdetected
+
+That is good news.
+
+It narrows the issue down more to **network representation / switch-bus topology / Y-bus assembly**, not basic asset import.
+
+---
+
+## 4. “There are two differences in the Y-bus matrix”
+
+This is the technical heart of the message.
+
+He says that compared to his model, there are basically **two Y-bus differences**, and they are related to how these suspicious connections are represented.
+
+He suggests two possible ways to represent them:
+
+### Option A: group them together as a bus-branch model
+
+Meaning:
+
+* collapse some directly connected nodes together
+* represent them as one equivalent bus connection
+
+This is simpler.
+
+### Option B: model them individually inside the busbar structure ("Sammelschienen")
+
+Meaning:
+
+* keep each connection point explicitly
+* define each switch / connection / node separately
+
+This is more accurate structurally, but much more complicated.
+
+So he is saying:
+
+> electrically these odd connections can either be simplified away or modeled explicitly, but you must be consistent.
+
+---
+
+## 5. Some buses match, some do not
+
+He says some named buses look fine, and some look different.
+
+That means the mismatch is **localized**, not global.
+
+So again, this supports:
+
+> the network as a whole is mostly okay, but certain local topological areas are represented differently.
+
+Especially suspicious are the buses he marked as “different”:
+
+* `CNN_F675B_J_29025_7`
+* `CNN_113F_J_21809_15`
+* `CNN_629_J_19740_37`
+* `CNN_67001.126 A11A grün_E_19633_`
+
+These are probably places where:
+
+* bus fusion differs
+* switch handling differs
+* unsupplied / disconnected structure is being treated differently
+
+---
+
+## 6. The really important part: pandapower merges buses across closed switches
+
+This is probably his main diagnosis.
+
+Pandapower internally converts the model from its own bus representation into PPC using `_pd2ppc`.
+
+During that process:
+
+> **buses connected by closed bus-bus switches are fused into one PPC bus**
+
+That is standard pandapower behavior.
+
+This is good for ordinary power flow because it simplifies the matrix.
+
+But it causes a problem for your use case.
+
+---
+
+## 7. Why this is a problem for your GNN / fast topology use case
+
+Your use case is not just “solve one power flow once.”
+
+You want to:
+
+* change switch states often
+* recalculate topology quickly
+* maybe generate thousands of variants
+* feed them into a GNN pipeline
+
+If pandapower fuses buses every time, then:
+
+* each switch change alters the bus structure
+* `_pd2ppc` mapping changes again
+* the Y-bus has to be rebuilt from scratch
+* this is slow
+
+So your colleague is saying:
+
+> pandapower’s default modeling is fine for standard load flow, but bad for fast repeated topology changes.
+
+That is why he says:
+
+> “I guess in your case we need to avoid this”
+
+Meaning: avoid relying on the standard fused `_pd2ppc` representation for your fast-switching workflow.
+
+---
+
+## 8. His solution: split Y-bus into two parts
+
+He proposes:
+
+[
+Y_{\text{total}} = Y_{\text{static}} + Y_{\text{switches}}
+]
+
+This is a very sensible idea.
+
+### `Y_static`
+
+Contains everything that usually does not change:
+
+* lines
+* transformers
+* fixed network admittances
+* permanent equipment
+
+This is built once.
+
+### `Y_switches`
+
+Contains only switch effects:
+
+* open switch → no connection
+* closed switch → very small impedance connection
+
+This part is small and can be rebuilt quickly.
+
+So instead of rebuilding the whole network each time, you only update the switch part.
+
+That is much faster.
+
+---
+
+## 9. Two network representations
+
+He says the code produces two Y-bus matrices:
+
+### A. Bus-Branch model: `722 x 722`
+
+This is the normal pandapower-style reduced network:
+
+* buses connected by closed switches are merged
+* good for ordinary power flow
+
+### B. Node-Breaker model: `3798 x 3798`
+
+This is a much more detailed model:
+
+* every CGMES connection node stays explicit
+* switches stay explicit
+* good for fast topology changes
+
+This is a big deal.
+
+It means he has essentially built both:
+
+* a **reduced solver-friendly view**
+* and a **detailed topology-friendly view**
+
+---
+
+## 10. What he is checking next
+
+He says he wants to test whether the detailed `3798 x 3798` node-breaker matrix, after applying switch states and the `_pd2ppc` logic, reduces consistently to the `722 x 722` bus-branch matrix.
+
+That means he wants to verify:
+
+> if I start from the full explicit topology and then “collapse” it according to closed switches, do I recover the same reduced Y-bus that pandapower gives?
+
+If yes, that is excellent, because then you have:
+
+* a physically explicit topology model for switching
+* and a consistent reduced model for power flow
+
+---
+
+# So what is your colleague saying in one sentence?
+
+He is saying:
+
+> The LVN CGMES can be solved in pandapower, but the real difficulty is not the power flow itself — it is that pandapower merges buses across closed switches, which is inconvenient for your topology-changing GNN workflow. Therefore, the better approach is to separate the Y-bus into a static part and a switch-dependent part, and possibly keep a node-breaker representation instead of relying only on pandapower’s fused bus-branch model.
+
+---
+
+# What this means for your previous debugging
+
+This means your earlier debugging was not useless, but the interpretation changes.
+
+Previously, you were looking for:
+
+* broken transformers
+* wrong slack
+* bad branch parameters
+* mysterious convergence blockers
+
+Now it seems the deeper issue is more like this:
+
+### Not mainly:
+
+* “the network is unsolvable”
+
+### More likely:
+
+* “the network representation changes too much when switches are fused”
+* “certain zero-lines / unsupplied areas are special topology artifacts”
+* “pandapower default `_pd2ppc` is not the right internal representation for your high-speed topology study”
+
+---
+
+# What you should do next
+
+I think the practical next step is:
+
+## 1. Stop treating this only as a convergence bug
+
+It is more of a **modeling architecture issue**.
+
+## 2. Separate two goals
+
+You have two different goals:
+
+### Goal A: ordinary AC power flow
+
+Then the bus-branch fused pandapower model is okay.
+
+### Goal B: fast topology variation for GNN
+
+Then you should keep a node-breaker style representation and update only switch admittances.
+
+## 3. Clarify what those zero-lines are
+
+Those suspicious lines should probably be classified as one of:
+
+* de-energized placeholders
+* busbar couplers
+* confidential/redacted connectors
+* topology-only connectors
+
+They should not just be blindly treated as ordinary transmission lines.
+
+## 4. Ask your colleague for the actual implementation details of:
+
+* how he constructs `Y_static`
+* how he constructs `Y_switches`
+* what impedance he uses for a closed switch
+* how he maps node-breaker to bus-branch
+* whether he still uses pandapower Newton on the reduced model
+
+---
+
+# Very short plain-English version
+
+Your colleague is basically saying:
+
+> “I can solve the LVN CGMES in pandapower. The main problem is not the power flow equations, but that pandapower automatically merges buses connected by closed switches. That is fine for normal load flow, but bad for your use case where you want to change topology quickly many times. So I split the admittance matrix into a fixed part and a switch-dependent part. I also keep a detailed node-breaker matrix from CGMES. That should be much better for fast GNN experiments.”
+
+If you want, I can turn your colleague’s message into a clean technical summary email or meeting note you can share with the team.
+
+
+
+/Users/changhunkim/PycharmProjects/PIGNN-Attn-LS/ScenarioSynthesis_PPC/CGMES_LVN_Debug/ybus_export.py
+/Users/changhunkim/PycharmProjects/PIGNN-Attn-LS/ScenarioSynthesis_PPC/CGMES_LVN_Debug/cgmes_load_plus_loadflow.py
+
+Yes. These two scripts are doing two different jobs.
+
+## 1) `cgmes_load_plus_loadflow.py`
+
+This is basically a **CGMES import + sanity check + power-flow test script**.
+
+### What it does
+
+It:
+
+* loads a CGMES zip into pandapower
+* prints a lot of diagnostics about the imported network
+* applies a few robustness fixes
+* tries several load-flow methods
+* prints result tables so you can compare with PowerFactory
+* exports the final net to JSON
+
+### In plain words
+
+This script answers:
+
+> “Can I load this CGMES into pandapower, fix the obvious bad data, run a power flow, and inspect the imported elements and results?”
+
+### Main steps inside
+
+#### A. Load the CGMES
+
+It imports the network with:
+
+* `from_cim(...)`
+
+and then prints counts of buses, lines, trafos, loads, generators, switches, etc.
+
+#### B. Show comparison-friendly previews
+
+It prints the first few rows of:
+
+* buses
+* loads
+* gens
+* sgens
+* lines
+* trafos
+
+Importantly, it tries to keep identifier columns like:
+
+* `origin_id`
+* `cim_id`
+* `rdf_id`
+* `uuid`
+* `name`
+
+So this script is made for **cross-checking against PowerFactory / CGMES IDs**.
+
+#### C. Diagnostics
+
+It checks things like:
+
+* how many switches there are
+* how many are open/closed
+* unsupplied buses
+* out-of-service elements
+* voltage levels
+* ext_grid/slack info
+* suspicious generator voltage setpoints
+* negative loads
+* total generation and load
+
+So this is the “what does the imported model actually look like?” script.
+
+#### D. Apply simple fixes
+
+It then applies three practical fixes:
+
+* unsupplied buses → set out of service
+* zero-impedance lines (`r=0` and `x=0`) → set out of service
+* generator `vm_pu` outside `[0.8, 1.2]` → force to `1.0`
+
+This matches what your colleague was saying earlier:
+these are not deep theoretical fixes, just **data-cleaning / robustness fixes**.
+
+#### E. Try power flow
+
+It tries in this order:
+
+1. AC Newton-Raphson with `init="dc"`
+2. AC Newton-Raphson with `init="flat"`
+3. DC power flow if AC fails
+
+So this script is directly testing:
+
+> “Does pandapower converge after basic cleanup?”
+
+#### F. Print result tables
+
+If it converges, it prints result comparison tables for:
+
+* buses
+* loads
+* gens
+* sgens
+* lines
+* trafos
+
+including things like:
+
+* voltage magnitude / angle
+* p/q results
+* loading percent
+* max/min voltages
+* overloaded lines
+
+This is useful for comparing with PowerFactory screenshots or exported reports.
+
+#### G. Save the network
+
+At the end it exports:
+
+* `network_converged.json`
+
+So you can reuse the cleaned / solved net later.
+
+---
+
+## 2) `ybus_export.py`
+
+This one is more advanced.
+It is a **Y-bus construction / export script**.
+
+### What it does
+
+It builds **two different Y-bus representations** of the same CGMES network:
+
+* a **bus-branch Y-bus**
+* a **node-breaker Y-bus**
+
+and exports them.
+
+This is the script that matches your colleague’s explanation about:
+
+* pandapower bus fusion
+* switch-explicit topology
+* `Y_total = Y_static + Y_switches`
+
+---
+
+# What the two Y-bus models mean
+
+## Model A: Bus-Branch Y-bus
+
+This is the normal pandapower-style model.
+
+### What happens here
+
+* closed bus-bus switches are merged by pandapower
+* the reduced network is built
+* power flow is run
+* `_pd2ppc` and `makeYbus` are used
+* you get a smaller Y-bus
+
+This is the standard “solver-friendly” representation.
+
+Your colleague comments in the code that this becomes something like:
+
+* about `722 x 722`
+
+So this is the matrix you would normally use for ordinary power flow.
+
+---
+
+## Model B: Node-Breaker Y-bus
+
+This is the more detailed topology-preserving model.
+
+### What happens here
+
+Instead of letting closed switches merge buses immediately, the script tries to keep:
+
+* each connectivity node explicit
+* switches explicit
+* topology editable
+
+This is the part designed for fast topology studies and likely for your GNN workflow.
+
+---
+
+# The important logic in `ybus_export.py`
+
+## Step 1: load and basic fixes
+
+Like the other script, it:
+
+* loads CGMES
+* disables zero-impedance lines
+* clamps strange generator voltage setpoints
+
+So again, it starts with a cleaned network.
+
+---
+
+## Step 2: build Model A (standard bus-branch)
+
+It:
+
+* deep-copies the net
+* disables isolated buses
+* runs `pp.runpp(...)`
+* calls `_pd2ppc(net_bb)`
+* calls `makeYbus(...)`
+
+This gives the ordinary pandapower Y-bus.
+
+It also exports a bus mapping:
+
+* pandapower bus index → internal `ppci` index
+
+That is useful because the internal Y-bus row order is not the same as `net.bus.index`.
+
+---
+
+## Step 3: identify “switch-only” buses
+
+This is a key part.
+
+The script detects buses that are connected **only via switches**, not via:
+
+* lines
+* trafos
+* trafo3w
+* impedances
+* ext_grid
+
+Why is this important?
+
+Because `_pd2ppc` may completely remove such buses if switches are open.
+
+So the script wants to preserve them in the node-breaker-style matrix.
+
+---
+
+## Step 4: create dummy anchors
+
+For switch-only buses or isolated buses, the script creates artificial helper elements:
+
+* dummy `ext_grid` at isolated buses
+* dummy very-high-impedance branches
+* or dummy shunts
+
+These are not meant to change the physics meaningfully.
+They are just there so pandapower does not drop those buses from the internal conversion.
+
+In plain words:
+
+> “Please keep this bus in the matrix, even if it is only topological.”
+
+That is a very practical trick.
+
+---
+
+## Step 5: open all bus-bus switches
+
+This is the core trick for the node-breaker model.
+
+It saves the original switch states, then sets all bus-bus switches to:
+
+* `closed = False`
+
+Why?
+
+Because this prevents pandapower from fusing buses during `_pd2ppc`.
+
+So now the static Y-bus can be built **without switch merging**.
+
+---
+
+## Step 6: build `Y_static`
+
+Then it constructs a Y-bus from the network with switches opened.
+
+This gives the part that contains only the permanent electrical elements:
+
+* lines
+* transformers
+* impedances
+* shunts
+* etc.
+
+So this is exactly your colleague’s idea:
+
+[
+Y_{\text{static}}
+]
+
+---
+
+## Step 7: build `Y_switches`
+
+Then there is a function:
+
+* `build_switch_matrix(switch_states)`
+
+This creates the admittance contribution of switches only.
+
+The idea is:
+
+* open switch → no admittance
+* closed switch → small impedance, so strong connection but not mathematically singular
+
+That means this matrix can be rebuilt very quickly whenever switch states change.
+
+So:
+
+[
+Y_{\text{total}} = Y_{\text{static}} + Y_{\text{switches}}
+]
+
+Exactly what your colleague described.
+
+---
+
+## Step 8: compare / reduce node-breaker to bus-branch
+
+From what is visible and from your colleague’s description, the script is also meant to check whether the explicit node-breaker representation can be made consistent with the reduced pandapower bus-branch one.
+
+That means:
+
+* detailed topology view for switching
+* reduced solver view for power flow
+
+---
+
+# So what is the practical difference between the two files?
+
+## `cgmes_load_plus_loadflow.py`
+
+This is mainly for:
+
+* checking the imported CGMES
+* cleaning obvious bad entries
+* running power flow
+* comparing results with PowerFactory
+
+It is a **debug / validation / comparison script**.
+
+---
+
+## `ybus_export.py`
+
+This is mainly for:
+
+* constructing Y-bus matrices
+* separating static and switch-dependent admittances
+* preserving node-breaker topology
+* supporting fast topology updates
+
+It is a **matrix-construction / topology-engineering script**.
+
+---
+
+# Why your colleague sent both
+
+Because together they represent the two sides of the problem:
+
+## Script 1 says:
+
+> “Can pandapower import and solve this CGMES at all?”
+
+## Script 2 says:
+
+> “How should we build the admittance matrix so topology changes are efficient and bus fusion does not destroy the structure we need?”
+
+---
+
+# The big idea behind both scripts
+
+Your colleague is moving from:
+
+* “just run pandapower load flow”
+
+to:
+
+* “use pandapower to get correct element models once”
+* “but manage topology and Y-bus more explicitly ourselves”
+
+That is especially useful for your case because you want:
+
+* many topology variants
+* repeated Y-bus updates
+* possibly GNN training / inference
+* avoiding full `_pd2ppc` rebuild every time
+
+---
+
+# Very short summary
+
+### `cgmes_load_plus_loadflow.py`
+
+Loads CGMES, inspects it, fixes obvious bad data, runs load flow, and prints comparison tables.
+
+### `ybus_export.py`
+
+Builds two Y-bus versions:
+
+* a reduced pandapower bus-branch matrix
+* a full switch-explicit node-breaker matrix
+
+and splits the total Y-bus into:
+
+* static equipment part
+* switch-dependent part
+
+So the second one is the more important script for your future fast-topology / GNN workflow.
+
+If you paste the rest of `ybus_export.py`, I can explain that file line by line too.
+
+Yes, **basically yes** — with one important nuance.
+
+## Short answer
+
+Your **Model A bus-branch Y-bus** is essentially the same kind of Y-bus as your case generator gets from:
+
+```python
+ppc_int = net._ppc["internal"]
+Ypu = _dense_ybus_from_ppc_internal(ppc_int)
+```
+
+So in your code, this part:
+
+```python
+if (ybus_mode.lower() == "ppcy") and (force_branch_shunt_pu is None):
+    Ypu = _dense_ybus_from_ppc_internal(ppc_int)
+    Y_matrix = Ypu * (S_base / np.outer(Vbase, Vbase))
+```
+
+is indeed the **same general object** as the colleague’s **Model A**:
+
+* pandapower internal
+* bus-fused
+* solver-ready
+* after `_pd2ppc` / internal conversion
+* suitable for standard load flow
+
+---
+
+# The important nuance
+
+It is the same **type of Y-bus**, but not always guaranteed to be produced in exactly the same way in every script.
+
+Why?
+
+Because Model A depends on:
+
+* the net before conversion
+* switch states
+* whether buses were fused
+* whether isolated buses were removed
+* whether dummy elements were inserted
+* whether some zero-impedance lines were disabled first
+* which pandapower path was used (`runpp`, `_pd2ppc`, `to_ppc`, `makeYbus`, etc.)
+
+So the right statement is:
+
+> **Your `ppcY` mode is pandapower’s internal bus-branch Y-bus, and this is conceptually the same as your colleague’s Model A.**
+
+But:
+
+> **the exact matrix can differ if the preprocessing differs.**
+
+---
+
+# In your code, what exactly is happening?
+
+## Your `ppcY` path
+
+You do:
+
+1. build/load a pandapower net
+2. call `pp.runpp(...)` once just to force compilation
+3. read:
+
+   * `net._ppc["internal"]["bus"]`
+   * `net._ppc["internal"]["branch"]`
+   * `net._ppc["internal"]["gen"]`
+   * `net._ppc["internal"]["Ybus"]`
+4. convert `Ybus` from pu to SI
+
+That means your Y-bus is:
+
+* **internal PPC order**
+* **already fused by pandapower where needed**
+* **already reflecting pandapower’s switch treatment**
+* **already including auxiliary handling used by pandapower**
+* **not node-breaker explicit**
+
+So yes, that is a classic **bus-branch reduced Y-bus**.
+
+---
+
+# Why this matches your colleague’s Model A
+
+Your colleague said Model A is:
+
+* pandapower standard model
+* closed switches merge buses
+* good for power flow
+
+That is exactly what your `ppcY` mode does.
+
+Pandapower internally does not keep every CGMES connectivity node as a separate Y-bus row in the standard solver representation. It reduces/fuses according to its internal conversion logic.
+
+That is why your colleague’s Model A had something like:
+
+* `722 x 722`
+
+while the raw CGMES node-breaker world had something like:
+
+* `3798 x 3798`
+
+Same idea:
+
+* **Model A = reduced internal solver matrix**
+* **Model B = explicit topology matrix**
+
+Your `ppcY` is clearly in the **Model A family**.
+
+---
+
+# What your `stamped` mode is
+
+Your `stamped` mode is slightly different.
+
+There you do not trust `ppc_int["Ybus"]` directly. Instead you reconstruct from:
+
+* `ppc_int["bus"]`
+* `ppc_int["branch"]`
+
+using your own stamping logic:
+
+```python
+Ypu = build_Y_stamped_from_ppc(ppc_used)
+Y_matrix = per_unit_to_SI(Ypu, ppc_used)
+```
+
+So:
+
+* `ppcY` = take pandapower internal `Ybus` directly
+* `stamped` = rebuild a Y-bus yourself from the internal PPC tables
+
+But both are still based on the **same reduced internal PPC world**, not node-breaker CGMES connectivity nodes.
+
+So even your `stamped` version is still much closer to **Model A** than to Model B.
+
+---
+
+# Very important distinction
+
+Your code does **not** build the colleague’s **Model B**.
+
+Because your code never keeps:
+
+* all CGMES connectivity nodes explicit
+* all switches as explicit Y-bus elements
+* no-fusion topology as the main matrix structure
+
+Your code starts after pandapower has already created the internal PPC representation.
+
+That means:
+
+* your rows = internal PPC buses
+* not raw CGMES connectivity nodes
+
+So your case generator is **not node-breaker**
+and **not switch-explicit in the colleague’s sense**.
+
+---
+
+# A clean way to say it
+
+You can say this to your colleague:
+
+> My `case_generation_pandapower(..., ybus_mode="ppcY")` uses `net._ppc["internal"]["Ybus"]`, so it is pandapower’s internal reduced bus-branch Y-bus after `_pd2ppc`-style fusion and solver preprocessing. Therefore it corresponds to your Model A, not to the node-breaker Model B.
+
+---
+
+# One more subtle point
+
+In your script you trigger the internal compilation by:
+
+```python
+pp.runpp(
+    net,
+    init="flat",
+    calculate_voltage_angles=True,
+    max_iteration=1,
+    enforce_q_lims=False,
+    tolerance_mva=1e9,
+)
+```
+
+Even if it does not converge, pandapower often still builds the internal `_ppc["internal"]`.
+
+So you are using runpp partly as a **compiler** to get:
+
+* `bus`
+* `branch`
+* `gen`
+* `Ybus`
+* `V0`
+
+That is okay, but it means your Y-bus is the one from the exact internal state produced during that compile path.
+
+So if your colleague’s Model A script does slightly different cleanup before conversion, the resulting Y-bus may be the same in nature but not identical numerically or dimensionally.
+
+---
+
+# Final answer
+
+Yes — your `ybus_mode="ppcY"` logic is essentially the same kind of Y-bus as the colleague’s **Model A bus-branch Y-bus**.
+
+More precisely:
+
+* **same concept**: pandapower internal reduced solver Y-bus
+* **same level**: bus-branch, fused, solver-ready
+* **not** the node-breaker explicit Y-bus
+* **may differ in exact entries/size** if preprocessing, switch handling, isolated bus treatment, or dummy elements differ
+
+The simplest label is:
+
+> **your `ppcY` = pandapower internal Model A-style Y-bus**
+
+And:
+
+> **your code currently does not construct Model B**.
+
+If you want, I can next draw a very small 4-bus toy example showing exactly how:
+
+* raw CGMES/node-breaker topology
+  turns into
+* pandapower fused bus-branch `ppc_int["Ybus"]`.
+
+Yes. In your colleague’s code, **Model A is exactly here**:
+
+```python id="foc8q7"
+# ============================================================
+# MODEL A: BUS-BRANCH Y-BUS
+# Standard pandapower: closed switches merge buses
+# Result: ~722 x 722
+# ============================================================
+print("\n" + "=" * 60)
+print("MODEL A: BUS-BRANCH Y-BUS")
+print("=" * 60)
+
+net_bb = copy.deepcopy(net)
+net_bb.bus.loc[list(isolated), 'in_service'] = False
+
+pp.runpp(net_bb, algorithm='nr', init='dc', max_iteration=100,
+         tolerance_mva=1e-6, calculate_voltage_angles=True,
+         check_connectivity=True, numba=False)
+print("  Power flow converged!")
+
+ppc_bb, ppci_bb = _pd2ppc(net_bb)
+Ybus_bb, _, _   = makeYbus(ppci_bb['baseMVA'], ppci_bb['bus'], ppci_bb['branch'])
+```
+
+## What that means
+
+This block does:
+
+1. copy the imported pandapower net
+2. deactivate isolated buses
+3. run normal pandapower power flow
+4. build pandapower internal PPC/PPCI
+5. compute Y-bus from the internal `ppci["bus"]` and `ppci["branch"]`
+
+So this is the **standard pandapower solver-side bus-branch Y-bus**.
+
+---
+
+## The exact line that creates Model A
+
+This is the key line:
+
+```python id="n3p4qj"
+Ybus_bb, _, _ = makeYbus(ppci_bb['baseMVA'], ppci_bb['bus'], ppci_bb['branch'])
+```
+
+That is the actual creation of the **Model A Y-bus**.
+
+But it depends on this line first:
+
+```python id="x64p1v"
+ppc_bb, ppci_bb = _pd2ppc(net_bb)
+```
+
+because `_pd2ppc` is what gives the **internal fused representation**.
+
+---
+
+## Why this is Model A
+
+Because `_pd2ppc(net_bb)` already applies pandapower’s internal reduction logic, including:
+
+* closed bus-bus switch fusion
+* internal bus renumbering
+* auxiliary buses where needed
+* solver-ready bus/branch tables
+
+Then `makeYbus(...)` builds the Y-bus from that reduced internal representation.
+
+So:
+
+* `net_bb` = original pandapower network
+* `ppci_bb` = internal reduced solver model
+* `Ybus_bb` = Model A bus-branch Y-bus
+
+---
+
+## Where the fusion happens
+
+You asked “where is it?”
+
+The fusion is **not** in `makeYbus`.
+It happens conceptually in:
+
+```python id="pw56vn"
+ppc_bb, ppci_bb = _pd2ppc(net_bb)
+```
+
+That is the important step.
+
+`makeYbus(...)` just stamps the admittance matrix from the already-prepared internal bus/branch tables.
+
+So the real answer is:
+
+* **fusion / reduction / internal mapping:** `_pd2ppc(net_bb)`
+* **matrix construction from that reduced model:** `makeYbus(...)`
+
+---
+
+## Relation to your case generator
+
+Your case generator does this:
+
+```python id="t7w5bo"
+pp.runpp(...)
+ppc_int = net._ppc["internal"]
+Ypu = _dense_ybus_from_ppc_internal(ppc_int)
+```
+
+That is extremely close to your colleague’s Model A.
+
+### Your code
+
+* takes `Ybus` directly from `net._ppc["internal"]["Ybus"]`
+
+### Colleague code
+
+* rebuilds `Ybus` from:
+
+  * `ppci_bb["bus"]`
+  * `ppci_bb["branch"]`
+
+using:
+
+```python id="fj6x0n"
+makeYbus(ppci_bb['baseMVA'], ppci_bb['bus'], ppci_bb['branch'])
+```
+
+So both are using the **same internal reduced pandapower world**.
+
+---
+
+## Clean comparison
+
+### Your `ppcY`
+
+```python id="x7qk2r"
+Ypu = _dense_ybus_from_ppc_internal(ppc_int)
+```
+
+### Colleague’s Model A
+
+```python id="m3zwsy"
+ppc_bb, ppci_bb = _pd2ppc(net_bb)
+Ybus_bb, _, _ = makeYbus(ppci_bb['baseMVA'], ppci_bb['bus'], ppci_bb['branch'])
+```
+
+These are basically two ways to get the same kind of object:
+
+* pandapower internal
+* bus-branch
+* fused
+* solver-ready
+
+---
+
+## Why your colleague runs `runpp` first
+
+He does:
+
+```python id="hnofle"
+pp.runpp(net_bb, ...)
+```
+
+and then again:
+
+```python id="g95a3i"
+ppc_bb, ppci_bb = _pd2ppc(net_bb)
+```
+
+Strictly speaking, if the goal were only to build the internal model, `_pd2ppc` is the main piece.
+
+But `runpp` is useful because it:
+
+* checks convergence
+* ensures the case is solvable
+* prepares internal structures
+* gives confidence that this bus-branch model is the operational one
+
+So in his script:
+
+* `runpp` = “does the standard pandapower PF converge?”
+* `_pd2ppc + makeYbus` = “extract the corresponding Model A Y-bus”
+
+---
+
+## Then what is Model B?
+
+Right below that, your colleague starts:
+
+```python id="f8qgtr"
+# ============================================================
+# MODEL B: NODE-BREAKER Y-BUS
+# Every connectivity node = one matrix row/column
+# Switches are explicit admittances (not merged)
+# Result: ~3798 x 3798
+# ============================================================
+```
+
+That whole later section is **not** standard pandapower fused Y-bus anymore.
+
+That is his custom explicit topology model:
+
+* all switches opened initially
+* dummy anchors added
+* static Y-bus built
+* switch matrix added separately
+
+So:
+
+* **Model A** = standard fused pandapower internal solver Y-bus
+* **Model B** = custom node-breaker explicit switch-aware Y-bus
+
+---
+
+## Short answer in one sentence
+
+In your colleague’s code, **Model A is the Y-bus named `Ybus_bb`, created in the “MODEL A: BUS-BRANCH Y-BUS” block, specifically by `_pd2ppc(net_bb)` followed by `makeYbus(...)`.**
+
+And yes, it is the same general kind of Y-bus as your case generator’s `ppc_int["Ybus"]`.
+
+can you make a script that compare my ppcY and colleague's mode A for a given CGMES_FILE?
+
+Yes. Here is a single script that compares:
+
+* **your ppcY**: `net._ppc["internal"]["Ybus"]` after `runpp(...)`
+* **your colleague’s Model A**: `_pd2ppc(net)` + `makeYbus(ppci["baseMVA"], ppci["bus"], ppci["branch"])`
+
+for a given `CGMES_FILE`.
+
+It checks:
+
+* matrix shape
+* nnz
+* max absolute difference
+* whether they are equal up to tolerance
+* whether bus / gen / branch tables match
+* whether bus lookup matches
+* a few largest differing Y-bus entries
+
+```python
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import copy
+import warnings
+import numpy as np
+import pandas as pd
+import scipy.sparse as sp
+
+warnings.filterwarnings("ignore")
+
+import pandapower as pp
+import pandapower.converter.cim.cim2pp.from_cim as cim2pp
+from pandapower.topology import unsupplied_buses
+from pandapower.pd2ppc import _pd2ppc
+from pandapower.pypower.makeYbus import makeYbus
+
+
+# ============================================================
+# CONFIG
+# ============================================================
+CGMES_FILE = r"/path/to/your/Changhun_LVN.zip"
+CGMES_VERSION = "2.4.15"
+IGNORE_ERRORS = True
+
+RUNPP_KWARGS = dict(
+    algorithm="nr",
+    init="dc",
+    max_iteration=100,
+    tolerance_mva=1e-6,
+    calculate_voltage_angles=True,
+    check_connectivity=True,
+    numba=False,
+)
+
+ABS_TOL = 1e-10
+REL_TOL = 1e-8
+TOPK_DIFFS = 20
+
+
+# ============================================================
+# HELPERS
+# ============================================================
+def to_csr_complex(x):
+    if sp.issparse(x):
+        return x.tocsr().astype(np.complex128)
+    return sp.csr_matrix(np.asarray(x, dtype=np.complex128))
+
+
+def sparse_abs_max(mat):
+    if mat.nnz == 0:
+        return 0.0
+    return float(np.max(np.abs(mat.data)))
+
+
+def rounded_array(a, decimals=12):
+    return np.round(np.asarray(a, dtype=float), decimals=decimals)
+
+
+def table_equal(a, b, decimals=12):
+    a = np.asarray(a, dtype=float)
+    b = np.asarray(b, dtype=float)
+    if a.shape != b.shape:
+        return False
+    return np.array_equal(np.round(a, decimals), np.round(b, decimals))
+
+
+def get_dense_if_small(mat, max_dim=5000):
+    if mat.shape[0] <= max_dim and mat.shape[1] <= max_dim:
+        return mat.toarray()
+    return None
+
+
+def largest_diff_entries(diff_csr, topk=20):
+    coo = diff_csr.tocoo()
+    if coo.nnz == 0:
+        return pd.DataFrame(columns=["row", "col", "abs_diff", "real_diff", "imag_diff"])
+
+    abs_vals = np.abs(coo.data)
+    order = np.argsort(-abs_vals)[:topk]
+
+    rows = []
+    for idx in order:
+        rows.append({
+            "row": int(coo.row[idx]),
+            "col": int(coo.col[idx]),
+            "abs_diff": float(abs_vals[idx]),
+            "real_diff": float(coo.data[idx].real),
+            "imag_diff": float(coo.data[idx].imag),
+        })
+    return pd.DataFrame(rows)
+
+
+def compare_sparse(A, B, abs_tol=1e-10, rel_tol=1e-8):
+    A = to_csr_complex(A)
+    B = to_csr_complex(B)
+
+    out = {
+        "shape_A": A.shape,
+        "shape_B": B.shape,
+        "nnz_A": int(A.nnz),
+        "nnz_B": int(B.nnz),
+        "same_shape": A.shape == B.shape,
+    }
+
+    if A.shape != B.shape:
+        out.update({
+            "exact_equal": False,
+            "allclose": False,
+            "max_abs_diff": np.nan,
+            "fro_norm_diff": np.nan,
+            "nnz_diff_matrix": np.nan,
+        })
+        return out, None
+
+    D = (A - B).tocsr()
+    out["nnz_diff_matrix"] = int(D.nnz)
+    out["max_abs_diff"] = sparse_abs_max(D)
+
+    if D.nnz == 0:
+        out["exact_equal"] = True
+        out["allclose"] = True
+        out["fro_norm_diff"] = 0.0
+        return out, D
+
+    out["exact_equal"] = False
+    out["fro_norm_diff"] = float(np.linalg.norm(D.data))
+
+    # allclose on sparse pattern union
+    A_dense = get_dense_if_small(A)
+    B_dense = get_dense_if_small(B)
+    if A_dense is not None and B_dense is not None:
+        out["allclose"] = bool(np.allclose(A_dense, B_dense, atol=abs_tol, rtol=rel_tol))
+    else:
+        # sparse fallback: check entrywise on union
+        Acoo = A.tocoo()
+        Bcoo = B.tocoo()
+
+        amap = {(int(r), int(c)): v for r, c, v in zip(Acoo.row, Acoo.col, Acoo.data)}
+        bmap = {(int(r), int(c)): v for r, c, v in zip(Bcoo.row, Bcoo.col, Bcoo.data)}
+        keys = set(amap.keys()) | set(bmap.keys())
+
+        ok = True
+        for k in keys:
+            av = amap.get(k, 0.0 + 0.0j)
+            bv = bmap.get(k, 0.0 + 0.0j)
+            if not np.allclose(av, bv, atol=abs_tol, rtol=rel_tol):
+                ok = False
+                break
+        out["allclose"] = ok
+
+    return out, D
+
+
+def print_section(title):
+    print("\n" + "=" * 80)
+    print(title)
+    print("=" * 80)
+
+
+# ============================================================
+# OPTIONAL: options for _pd2ppc without direct runpp dependence
+# ============================================================
+def set_pp_options(net_obj):
+    net_obj._options = {
+        "calculate_voltage_angles": True,
+        "trafo_model": "t",
+        "check_connectivity": False,
+        "mode": "pf",
+        "switch_rx_ratio": 2,
+        "recycle": None,
+        "delta": 0,
+        "voltage_depend_loads": False,
+        "trafo3w_losses": "hv",
+        "init_vm_pu": "flat",
+        "init_va_degree": "flat",
+        "distributed_slack": False,
+        "enforce_p_lims": False,
+        "enforce_q_lims": False,
+        "p_lim_default": 1e9,
+        "q_lim_default": 1e9,
+        "neglect_open_switch_branches": False,
+        "consider_line_temperature": False,
+        "tdpf": False,
+        "tdpf_update_r_theta": False,
+        "tdpf_delay_s": None,
+        "numba": False,
+        "lightsim2grid": False,
+        "algorithm": "nr",
+        "max_iteration": 10,
+        "tolerance_mva": 1e-8,
+        "v_debug": False,
+        "sequence": None,
+    }
+
+
+# ============================================================
+# FIXES
+# ============================================================
+def apply_basic_fixes(net):
+    isolated = unsupplied_buses(net)
+
+    zero_line_mask = (
+        (net.line["r_ohm_per_km"] == 0) &
+        (net.line["x_ohm_per_km"] == 0)
+    )
+    n_zero_lines = int(zero_line_mask.sum())
+    if n_zero_lines > 0:
+        net.line.loc[zero_line_mask, "in_service"] = False
+
+    n_gen_vm_fixed = 0
+    if len(net.gen) > 0:
+        bad_vm = (net.gen["vm_pu"] < 0.8) | (net.gen["vm_pu"] > 1.2)
+        n_gen_vm_fixed = int(bad_vm.sum())
+        if n_gen_vm_fixed > 0:
+            net.gen.loc[bad_vm, "vm_pu"] = 1.0
+
+    return {
+        "isolated": isolated,
+        "n_isolated": len(isolated),
+        "n_zero_lines_disabled": n_zero_lines,
+        "n_gen_vm_fixed": n_gen_vm_fixed,
+    }
+
+
+# ============================================================
+# BUILD YOUR ppcY
+# ============================================================
+def build_your_ppcy(net):
+    net1 = copy.deepcopy(net)
+
+    pp.runpp(net1, **RUNPP_KWARGS)
+
+    if "_ppc" not in net1 or "internal" not in net1._ppc:
+        raise RuntimeError("net._ppc['internal'] not available after runpp")
+
+    ppc_int = net1._ppc["internal"]
+
+    Y_ppcy = to_csr_complex(ppc_int["Ybus"])
+    bus = np.asarray(ppc_int["bus"], dtype=float)
+    gen = np.asarray(ppc_int.get("gen", np.empty((0, 0))), dtype=float)
+    branch = np.asarray(ppc_int["branch"], dtype=float)
+
+    lookups = copy.deepcopy(net1.get("_pd2ppc_lookups", {}))
+
+    return {
+        "net": net1,
+        "ppc_int": ppc_int,
+        "Ybus": Y_ppcy,
+        "bus": bus,
+        "gen": gen,
+        "branch": branch,
+        "lookups": lookups,
+    }
+
+
+# ============================================================
+# BUILD COLLEAGUE MODEL A
+# ============================================================
+def build_colleague_model_a(net):
+    net2 = copy.deepcopy(net)
+
+    # same preprocessing as in your colleague code
+    isolated = unsupplied_buses(net2)
+    net2.bus.loc[list(isolated), "in_service"] = False
+
+    pp.runpp(net2, **RUNPP_KWARGS)
+
+    ppc_bb, ppci_bb = _pd2ppc(net2)
+    Y_bb, _, _ = makeYbus(ppci_bb["baseMVA"], ppci_bb["bus"], ppci_bb["branch"])
+
+    lookups = copy.deepcopy(net2.get("_pd2ppc_lookups", {}))
+
+    return {
+        "net": net2,
+        "ppc": ppc_bb,
+        "ppci": ppci_bb,
+        "Ybus": to_csr_complex(Y_bb),
+        "bus": np.asarray(ppci_bb["bus"], dtype=float),
+        "gen": np.asarray(ppci_bb.get("gen", np.empty((0, 0))), dtype=float),
+        "branch": np.asarray(ppci_bb["branch"], dtype=float),
+        "lookups": lookups,
+    }
+
+
+# ============================================================
+# MAIN
+# ============================================================
+def main():
+    print_section("LOAD CGMES")
+    net = cim2pp.from_cim(
+        file_list=CGMES_FILE,
+        cgmes_version=CGMES_VERSION,
+        ignore_errors=IGNORE_ERRORS
+    )
+    print(f"Loaded: {CGMES_FILE}")
+    print(f"Buses:    {len(net.bus)}")
+    print(f"Lines:    {len(net.line)}")
+    print(f"Trafo2W:  {len(net.trafo)}")
+    print(f"Trafo3W:  {len(net.trafo3w)}")
+    print(f"Switches: {len(net.switch)}")
+
+    print_section("APPLY BASIC FIXES ON BASE NET")
+    fix_info = apply_basic_fixes(net)
+    for k, v in fix_info.items():
+        if k == "isolated":
+            print(f"{k}: <set of size {len(v)}>")
+        else:
+            print(f"{k}: {v}")
+
+    print_section("BUILD YOUR ppcY")
+    yours = build_your_ppcy(net)
+    print(f"Ybus shape: {yours['Ybus'].shape}, nnz={yours['Ybus'].nnz}")
+    print(f"bus shape: {yours['bus'].shape}")
+    print(f"gen shape: {yours['gen'].shape}")
+    print(f"branch shape: {yours['branch'].shape}")
+
+    print_section("BUILD COLLEAGUE MODEL A")
+    colleague = build_colleague_model_a(net)
+    print(f"Ybus shape: {colleague['Ybus'].shape}, nnz={colleague['Ybus'].nnz}")
+    print(f"bus shape: {colleague['bus'].shape}")
+    print(f"gen shape: {colleague['gen'].shape}")
+    print(f"branch shape: {colleague['branch'].shape}")
+
+    print_section("COMPARE Ybus")
+    ycmp, ydiff = compare_sparse(
+        yours["Ybus"],
+        colleague["Ybus"],
+        abs_tol=ABS_TOL,
+        rel_tol=REL_TOL,
+    )
+    for k, v in ycmp.items():
+        print(f"{k}: {v}")
+
+    print_section("COMPARE INTERNAL TABLES")
+    print(f"bus table equal (round12):    {table_equal(yours['bus'], colleague['bus'])}")
+    print(f"gen table equal (round12):    {table_equal(yours['gen'], colleague['gen'])}")
+    print(f"branch table equal (round12): {table_equal(yours['branch'], colleague['branch'])}")
+
+    print_section("COMPARE LOOKUPS")
+    your_bus_lookup = np.asarray(yours["lookups"].get("bus", []))
+    col_bus_lookup = np.asarray(colleague["lookups"].get("bus", []))
+
+    print(f"your bus lookup len:      {len(your_bus_lookup)}")
+    print(f"colleague bus lookup len: {len(col_bus_lookup)}")
+
+    if your_bus_lookup.shape == col_bus_lookup.shape:
+        same_lookup = np.array_equal(your_bus_lookup, col_bus_lookup)
+        print(f"bus lookup exactly equal: {same_lookup}")
+        if not same_lookup:
+            diff_idx = np.where(your_bus_lookup != col_bus_lookup)[0]
+            print(f"number of differing lookup entries: {len(diff_idx)}")
+            print(f"first 20 differing pp bus indices: {diff_idx[:20].tolist()}")
+    else:
+        print("bus lookup shapes differ")
+
+    if ydiff is not None:
+        print_section(f"TOP {TOPK_DIFFS} LARGEST Ybus DIFFERENCES")
+        df_top = largest_diff_entries(ydiff, topk=TOPK_DIFFS)
+        if len(df_top) == 0:
+            print("No differences.")
+        else:
+            print(df_top.to_string(index=False))
+
+    print_section("INTERPRETATION")
+    if ycmp["same_shape"] and ycmp["allclose"]:
+        print("Result: your ppcY and colleague Model A are numerically the same up to tolerance.")
+    elif ycmp["same_shape"]:
+        print("Result: same dimension, but numerically different.")
+        print("Check whether one path deactivates buses / lines differently before _pd2ppc.")
+        print("The biggest clues are:")
+        print("- bus lookup differences")
+        print("- bus/gen/branch table differences")
+        print("- largest Ybus differing entries above")
+    else:
+        print("Result: dimensions differ.")
+        print("That usually means the two paths produced different internal fused solver models.")
+
+    print("\nDone.")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+## What this script is really comparing
+
+It compares these two paths:
+
+### Your path
+
+`runpp(net)` → `net._ppc["internal"]["Ybus"]`
+
+### Colleague path
+
+`runpp(net_bb)` → `_pd2ppc(net_bb)` → `makeYbus(ppci["baseMVA"], ppci["bus"], ppci["branch"])`
+
+So this tells you whether your `ppcY` and your colleague’s **Model A** are actually the same for the same CGMES case.
+
+## Important note
+
+Your colleague’s Model A explicitly does this before `runpp`:
+
+```python
+isolated = unsupplied_buses(net_bb)
+net_bb.bus.loc[list(isolated), "in_service"] = False
+```
+
+Your own generator may not do exactly that in the same place or in the same way. If they differ, the resulting internal solver model may differ too.
+
+## If you want the cleanest apples-to-apples comparison
+
+The next step would be a second version that compares:
+
+1. **your current generator logic exactly as-is**
+2. **colleague Model A exactly as-is**
+
+and prints a side-by-side report of where the preprocessing diverges.
+
+these are the result, why internal tables are not equal as well as lookups? :
+
+/Users/changhunkim/anaconda3/envs/Python3.12_PandaPower3.4.0/bin/python /Users/changhunkim/PycharmProjects/PIGNN-Attn-LS/ScenarioSynthesis_PPC/CGMES_LVN_Debug/compare_ppcY_with_makeYbus.py
+
+================================================================================
+LOAD CGMES
+================================================================================
+/private/var/folders/d0/_37jvj2910s_yjh7gng656_40000gn/T/tmpn573jqjg/__MACOSX/LVN_PowerFactory_fixed is not a valid file!
+Loaded: /Users/changhunkim/PycharmProjects/PIGNN-Attn-LS/CGMES_to_PandaPower_clean/LVN_PowerFactory_fixed.zip
+Buses:    3782
+Lines:    608
+Trafo2W:  200
+Trafo3W:  16
+Switches: 3630
+
+================================================================================
+APPLY BASIC FIXES ON BASE NET
+================================================================================
+isolated: <set of size 582>
+n_isolated: 582
+n_zero_lines_disabled: 2
+n_gen_vm_fixed: 0
+
+================================================================================
+BUILD YOUR ppcY
+================================================================================
+Ybus shape: (722, 722), nnz=2288
+bus shape: (722, 18)
+gen shape: (6, 26)
+branch shape: (796, 26)
+
+================================================================================
+BUILD COLLEAGUE MODEL A
+================================================================================
+Ybus shape: (722, 722), nnz=2288
+bus shape: (722, 18)
+gen shape: (6, 26)
+branch shape: (796, 26)
+
+================================================================================
+COMPARE Ybus
+================================================================================
+shape_A: (722, 722)
+shape_B: (722, 722)
+nnz_A: 2288
+nnz_B: 2288
+same_shape: True
+nnz_diff_matrix: 0
+max_abs_diff: 0.0
+exact_equal: True
+allclose: True
+fro_norm_diff: 0.0
+
+================================================================================
+COMPARE INTERNAL TABLES
+================================================================================
+bus table equal (round12):    False
+gen table equal (round12):    False
+branch table equal (round12): False
+
+================================================================================
+COMPARE LOOKUPS
+================================================================================
+your bus lookup len:      3798
+colleague bus lookup len: 3798
+bus lookup exactly equal: False
+number of differing lookup entries: 106
+first 20 differing pp bus indices: [63, 127, 142, 165, 199, 207, 211, 215, 302, 340, 404, 443, 452, 453, 550, 586, 667, 671, 685, 713]
+
+================================================================================
+TOP 20 LARGEST Ybus DIFFERENCES
+================================================================================
+No differences.
+
+================================================================================
+INTERPRETATION
+================================================================================
+Result: your ppcY and colleague Model A are numerically the same up to tolerance.
+
+Done.
+
+Process finished with exit code 0
+
+Because **Ybus is the real electrical object**, while the **tables and lookups are just one internal representation** that pandapower used to build it.
+
+So your result means:
+
+* the two paths produce the **same electrical network seen by the solver**
+* but pandapower reached that same network through a **different internal indexing / ordering / fusion mapping**
+
+That is why:
+
+* `Ybus` is exactly equal
+* yet `bus`, `gen`, `branch`, and `_pd2ppc_lookups["bus"]` are not exactly equal
+
+## The key idea
+
+Many different internal tables can generate the **same Ybus**.
+
+Think of it like this:
+
+* `Ybus` = the final assembled circuit matrix
+* `bus/gen/branch/lookups` = the bookkeeping used to assemble that matrix
+
+If bookkeeping changes only by:
+
+* row order,
+* which original buses were fused into which internal row,
+* order of generators or branches,
+* placement of auxiliary buses,
+* internal numbering of fused switch groups,
+
+then the final `Ybus` can still be identical.
+
+## Why this happens in pandapower
+
+Pandapower does not keep original bus indices as solver indices.
+
+It does several internal transformations, for example:
+
+* removes out-of-service / unsupplied parts
+* fuses buses connected by closed bus-bus switches
+* creates auxiliary buses for elements like `trafo3w`
+* reindexes everything into compact solver rows
+* updates generator and branch endpoint indices to that internal numbering
+
+So two builds can both end at the same 722-bus solver model, but still differ in:
+
+* which fused group gets which internal row number
+* how some auxiliary rows are ordered
+* the order of rows in `gen`
+* the order of rows in `branch`
+* the content of `_pd2ppc_lookups["bus"]` for buses that were fused or dropped
+
+## Why the lookup differs
+
+`_pd2ppc_lookups["bus"]` is not a physical quantity. It is only:
+
+* **pandapower bus index** → **internal ppc/ppci row index**
+
+If pandapower changes the internal numbering of fused groups, the lookup changes too.
+
+For example:
+
+* in one run, original buses `{A,B,C}` may be fused into internal row `120`
+* in another run, the same fused group may be internal row `121`
+
+That changes the lookup, but not the actual electrical model.
+
+Also, for buses that are:
+
+* isolated,
+* switched out,
+* fused into another bus,
+* replaced by auxiliary internal rows,
+
+the lookup can differ even when the reduced final solver matrix is the same.
+
+## Why bus/gen/branch tables differ
+
+Same reason: they are indexed by internal row numbers.
+
+Examples:
+
+### Bus table
+
+Can differ because:
+
+* internal bus rows are permuted
+* fused bus groups got a different row index
+* auxiliary buses are inserted in a different place
+
+### Gen table
+
+Can differ because:
+
+* generator bus indices refer to internal bus rows
+* if bus row numbering changes, `GEN_BUS` changes
+* ext_grid/gen order may differ
+
+### Branch table
+
+Can differ because:
+
+* `F_BUS` and `T_BUS` depend on internal bus numbering
+* branch row order may differ
+* auxiliary branches for `trafo3w` may be ordered differently
+
+But as long as the stamping into Ybus is the same, the final matrix is the same.
+
+## Your exact result says something important
+
+This part is the most important:
+
+* same `Ybus shape`
+* same `nnz`
+* `nnz_diff_matrix: 0`
+* `max_abs_diff: 0.0`
+* `exact_equal: True`
+
+That means not just “close enough”.
+
+It means:
+
+**the final bus-branch solver model is exactly the same matrix.**
+
+So the differences in internal tables are not a real electrical mismatch. They are only a **representation mismatch**.
+
+## Why 106 lookup entries differ although Ybus is identical
+
+That usually means those are buses involved in one of these:
+
+* closed-switch fusion groups
+* isolated / unsupplied areas
+* auxiliary buses around `trafo3w`
+* buses removed from service before the solver model is built
+
+So the original bus → internal row mapping changed for those buses, but after all fusions/reductions the final solver network is still identical.
+
+In other words:
+
+* the **map from original CGMES buses to solver rows** changed a bit
+* the **final solver graph and admittance matrix** did not
+
+## Practical conclusion
+
+For your colleague’s **Model A**, the answer is:
+
+**Yes, your `ppcY` is electrically the same as Model A.**
+
+Even though:
+
+* tables are not equal
+* lookups are not equal
+
+that does **not** mean the solver model is different.
+
+It only means:
+
+* pandapower bookkeeping is not canonical
+* internal indexing is not guaranteed to be unique
+
+## What you should trust here
+
+For electrical equivalence, trust in this order:
+
+1. `Ybus`
+2. bus type sets / ref-pv-pq sets
+3. Sbus / V0
+4. only after that, raw internal table equality
+5. raw lookup equality is least important
+
+So in your result, the strongest evidence is already there:
+
+**your ppcY and colleague Model A are the same electrical model.**
+
+## One-line summary you can share
+
+“The internal bus/gen/branch tables and `_pd2ppc` lookups differ because pandapower’s internal indexing and bus fusion are not unique. However, since the final `Ybus` is exactly identical, both implementations produce the same electrical bus-branch model.”
+
+I can also give you a second comparison script that checks whether the table differences are only due to row permutation/reindexing rather than actual physics differences.
