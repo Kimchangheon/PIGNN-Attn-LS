@@ -54,6 +54,11 @@ parser.add_argument("--armijo_min_alpha", type=float, default=0.0625)
 parser.add_argument("--vlimit", action="store_true")
 parser.add_argument('--DthetaMax', type=float, default=0.3)
 parser.add_argument('--DvmFrac', type=float, default=0.1)
+parser.add_argument("--physics_loss_form", type=str, default="mse", choices=("mse", "huber", "logcosh"))
+parser.add_argument("--physics_residual_norm", type=str, default="none", choices=("none", "setpoint", "graph"))
+parser.add_argument("--physics_norm_eps", type=float, default=1e-6)
+parser.add_argument("--physics_huber_delta", type=float, default=1.0)
+parser.add_argument("--physics_final_weight", type=float, default=0.0)
 parser.add_argument('--train_ratio', type=float, default=0.3333)
 parser.add_argument('--valid_ratio', type=float, default=0.3333)
 
@@ -68,6 +73,7 @@ parser.add_argument("--BATCH", type=int, default=16)
 parser.add_argument("--EPOCHS", type=int, default=20)
 parser.add_argument("--LR", type=float, default=1e-4)
 parser.add_argument("--VAL_EVERY", type=int, default=1)
+parser.add_argument("--residual_tol_pu", type=float, default=1e-6)
 
 parser.add_argument("--PARQUET", type=str, nargs='+', required=True, help="Path to parquet data file(s)")
 parser.add_argument("--seed_value", type=int, default=42)
@@ -153,12 +159,17 @@ shortened_names = ['_'.join(name.split('_')[:3]) for name in parquet_filenames]
 parquet_filename = '_and_'.join(shortened_names)
 
 armijo_tag = "True" if args.use_armijo else "False"
+loss_tag = (
+    f"_ploss{args.physics_loss_form}"
+    f"_pnorm{args.physics_residual_norm}"
+    f"_pfinal{args.physics_final_weight:g}"
+)
 
 
 RUNNAME = (
     f"{parquet_filename}_K{args.K}_d{args.d}_dhi{args.d_hi}"
     f"_nheads{args.n_heads}_numattn{args.num_attn_layers}"
-    f"_armijo{armijo_tag}_ep{args.EPOCHS}_TrainRatio{args.train_ratio}"
+    f"_armijo{armijo_tag}{loss_tag}_ep{args.EPOCHS}_TrainRatio{args.train_ratio}"
 )
 BEST_CKPT_PATH = f"./results/ckpt/{RUNNAME}_{EPOCHS}_best_model.ckpt"
 if args.log_to_file:
@@ -194,7 +205,9 @@ print(
     f"MODEL:{MODEL}, PINN:{PINN}, Block:{BLOCK_DIAG}, d:{d}, d_hi:{d_hi}, n_heads:{n_heads}, "
     f"K:{K}, Runname:{RUNNAME}, PARQUET:{PARQUET}, BATCH:{BATCH}, EP:{EPOCHS}, LR:{LR}, "
     f"no_cache_dense_ybus:{args.no_cache_dense_ybus}, lazy_parquet:{args.lazy_parquet}, "
-    f"row_group_cache_size:{args.row_group_cache_size}"
+    f"row_group_cache_size:{args.row_group_cache_size}, "
+    f"physics_loss_form:{args.physics_loss_form}, physics_residual_norm:{args.physics_residual_norm}, "
+    f"physics_final_weight:{args.physics_final_weight}, DthetaMax:{args.DthetaMax}, DvmFrac:{args.DvmFrac}"
 )
 
 
@@ -325,6 +338,13 @@ elif args.model == "GNSMsg_EdgeSelfAttn":
         armijo_c1=args.armijo_c1,
         armijo_max_backtracks=args.armijo_max_backtracks,
         armijo_min_alpha=args.armijo_min_alpha,
+        dtheta_max=args.DthetaMax,
+        dvm_frac=args.DvmFrac,
+        physics_loss_form=args.physics_loss_form,
+        physics_residual_norm=args.physics_residual_norm,
+        physics_norm_eps=args.physics_norm_eps,
+        physics_huber_delta=args.physics_huber_delta,
+        physics_final_weight=args.physics_final_weight,
     ).to(device)
 
 else:
@@ -541,6 +561,8 @@ def compute_power_flow_residual_metrics(Y, Vpred, Sset, bus_type, *, n_nodes_per
     metrics = {
         "max_dp_pu": max_dp_pu,
         "max_dq_pu": max_dq_pu,
+        "dp_abs_valid": dp_abs[p_mask].detach(),
+        "dq_abs_valid": dq_abs[q_mask].detach(),
     }
 
     if S_base is not None:
@@ -557,6 +579,76 @@ def format_residual_summary(max_dp_pu, max_dq_pu):
     return f"(ΔP∞ {max_dp_pu:.3e} pu, ΔQ∞ {max_dq_pu:.3e} pu)"
 
 
+def _empty_residual_distribution():
+    return {
+        "mean_dp_pu": 0.0,
+        "mean_dq_pu": 0.0,
+        "median_dp_pu": 0.0,
+        "median_dq_pu": 0.0,
+        "p95_dp_pu": 0.0,
+        "p95_dq_pu": 0.0,
+        "p99_dp_pu": 0.0,
+        "p99_dq_pu": 0.0,
+        "rmse_dp_pu": 0.0,
+        "rmse_dq_pu": 0.0,
+        "frac_dp_below_tol": 0.0,
+        "frac_dq_below_tol": 0.0,
+        "n_dp": 0,
+        "n_dq": 0,
+    }
+
+
+def finalize_residual_distribution(dp_values, dq_values, *, tol_pu):
+    dist = _empty_residual_distribution()
+
+    if dp_values:
+        dp = torch.cat(dp_values).float()
+        dist.update({
+            "mean_dp_pu": dp.mean().item(),
+            "median_dp_pu": dp.median().item(),
+            "p95_dp_pu": torch.quantile(dp, 0.95).item(),
+            "p99_dp_pu": torch.quantile(dp, 0.99).item(),
+            "rmse_dp_pu": torch.sqrt((dp ** 2).mean()).item(),
+            "frac_dp_below_tol": (dp <= tol_pu).float().mean().item(),
+            "n_dp": int(dp.numel()),
+        })
+
+    if dq_values:
+        dq = torch.cat(dq_values).float()
+        dist.update({
+            "mean_dq_pu": dq.mean().item(),
+            "median_dq_pu": dq.median().item(),
+            "p95_dq_pu": torch.quantile(dq, 0.95).item(),
+            "p99_dq_pu": torch.quantile(dq, 0.99).item(),
+            "rmse_dq_pu": torch.sqrt((dq ** 2).mean()).item(),
+            "frac_dq_below_tol": (dq <= tol_pu).float().mean().item(),
+            "n_dq": int(dq.numel()),
+        })
+
+    return dist
+
+
+def format_residual_distribution_compact(dist):
+    return (
+        f"(mean |ΔP| {dist['mean_dp_pu']:.3e}, |ΔQ| {dist['mean_dq_pu']:.3e} pu; "
+        f"p95 |ΔP| {dist['p95_dp_pu']:.3e}, |ΔQ| {dist['p95_dq_pu']:.3e} pu; "
+        f"tol≤ {dist['frac_dp_below_tol']:.2%} P, {dist['frac_dq_below_tol']:.2%} Q)"
+    )
+
+
+def format_residual_distribution_full(dist, *, tol_pu):
+    return (
+        f"Residual distribution over PV+PQ/PQ buses (tol={tol_pu:.1e} pu):\n"
+        f"  mean   |ΔP| {dist['mean_dp_pu']:.4e} pu | |ΔQ| {dist['mean_dq_pu']:.4e} pu\n"
+        f"  median |ΔP| {dist['median_dp_pu']:.4e} pu | |ΔQ| {dist['median_dq_pu']:.4e} pu\n"
+        f"  p95    |ΔP| {dist['p95_dp_pu']:.4e} pu | |ΔQ| {dist['p95_dq_pu']:.4e} pu\n"
+        f"  p99    |ΔP| {dist['p99_dp_pu']:.4e} pu | |ΔQ| {dist['p99_dq_pu']:.4e} pu\n"
+        f"  RMSE   ΔP   {dist['rmse_dp_pu']:.4e} pu | ΔQ   {dist['rmse_dq_pu']:.4e} pu\n"
+        f"  frac below tol: P {dist['frac_dp_below_tol']:.2%} ({dist['n_dp']} entries), "
+        f"Q {dist['frac_dq_below_tol']:.2%} ({dist['n_dq']} entries)"
+    )
+
+
 # ------------------------------------------------------------------
 # Epoch runner
 # ------------------------------------------------------------------
@@ -571,6 +663,8 @@ def run_epoch(loader, *, train: bool, pinn: bool):
     sum_max_dq_pu = 0.0
     sum_max_dp_mva = 0.0
     sum_max_dq_mva = 0.0
+    dp_dist_values = []
+    dq_dist_values = []
     n_graphs_total = 0
 
     with torch.set_grad_enabled(train):
@@ -707,6 +801,8 @@ def run_epoch(loader, *, train: bool, pinn: bool):
             sum_mse_ang += mse_ang.item() * B_eff
             sum_max_dp_pu += residual_metrics["max_dp_pu"].sum().item()
             sum_max_dq_pu += residual_metrics["max_dq_pu"].sum().item()
+            dp_dist_values.append(residual_metrics["dp_abs_valid"].detach().cpu())
+            dq_dist_values.append(residual_metrics["dq_abs_valid"].detach().cpu())
             if "max_dp_mva" in residual_metrics:
                 sum_max_dp_mva += residual_metrics["max_dp_mva"].sum().item()
                 sum_max_dq_mva += residual_metrics["max_dq_mva"].sum().item()
@@ -719,6 +815,11 @@ def run_epoch(loader, *, train: bool, pinn: bool):
     mean_max_dq_pu = sum_max_dq_pu / max(n_graphs_total, 1)
     mean_max_dp_mva = sum_max_dp_mva / max(n_graphs_total, 1)
     mean_max_dq_mva = sum_max_dq_mva / max(n_graphs_total, 1)
+    residual_dist = finalize_residual_distribution(
+        dp_dist_values,
+        dq_dist_values,
+        tol_pu=args.residual_tol_pu,
+    )
     return (
         mean_loss,
         mean_mse,
@@ -728,6 +829,7 @@ def run_epoch(loader, *, train: bool, pinn: bool):
         mean_max_dq_pu,
         mean_max_dp_mva,
         mean_max_dq_mva,
+        residual_dist,
     )
 
 
@@ -753,6 +855,7 @@ if "train" in args.mode:
         train_max_dq_pu,
         _train_max_dp_mva,
         _train_max_dq_mva,
+        _train_residual_dist,
     ) = run_epoch(train_loader, train=False, pinn=PINN)
     train_rmse = math.sqrt(train_mse)
     train_rmse_mag = math.sqrt(train_mse_mag)
@@ -767,6 +870,7 @@ if "train" in args.mode:
         val_max_dq_pu,
         _val_max_dp_mva,
         _val_max_dq_mva,
+        val_residual_dist,
     ) = run_epoch(val_loader, train=False, pinn=PINN)
     val_rmse = math.sqrt(val_mse)
     val_rmse_mag = math.sqrt(val_mse_mag)
@@ -779,7 +883,8 @@ if "train" in args.mode:
         f"{format_residual_summary(train_max_dp_pu, train_max_dq_pu)} | "
         f"valid loss {val_loss:.4e}  rmse {val_rmse:.4e} "
         f"(mag {val_rmse_mag:.4e}, ang {val_rmse_ang_deg:.4e}°) "
-        f"{format_residual_summary(val_max_dp_pu, val_max_dq_pu)}"
+        f"{format_residual_summary(val_max_dp_pu, val_max_dq_pu)} "
+        f"{format_residual_distribution_compact(val_residual_dist)}"
     )
 
     for epoch in range(1, EPOCHS + 1):
@@ -794,6 +899,7 @@ if "train" in args.mode:
             train_max_dq_pu,
             _train_max_dp_mva,
             _train_max_dq_mva,
+            _train_residual_dist,
         ) = run_epoch(train_loader, train=True, pinn=PINN)
         train_rmse = math.sqrt(train_mse)
         train_rmse_mag = math.sqrt(train_mse_mag)
@@ -814,6 +920,7 @@ if "train" in args.mode:
                 val_max_dq_pu,
                 _val_max_dp_mva,
                 _val_max_dq_mva,
+                val_residual_dist,
             ) = run_epoch(val_loader, train=False, pinn=PINN)
             val_rmse = math.sqrt(val_mse)
             val_rmse_mag = math.sqrt(val_mse_mag)
@@ -832,6 +939,7 @@ if "train" in args.mode:
                 f"valid loss {val_loss:.4e}  rmse {val_rmse:.4e} "
                 f"(mag {val_rmse_mag:.4e}, ang {val_rmse_ang_deg:.4e}°) "
                 f"{format_residual_summary(val_max_dp_pu, val_max_dq_pu)} | "
+                f"{format_residual_distribution_compact(val_residual_dist)} | "
                 f"time {time.time() - t0:.2f}s"
             )
 
@@ -917,6 +1025,7 @@ if "test" in args.mode:
         test_max_dq_pu,
         test_max_dp_mva,
         test_max_dq_mva,
+        test_residual_dist,
     ) = run_epoch(test_loader, train=False, pinn=PINN)
 
     test_rmse = math.sqrt(test_mse)
@@ -932,6 +1041,7 @@ if "test" in args.mode:
             f" | ΔP∞ : {test_max_dp_pu:.4e} pu ({test_max_dp_mva:.4e} MW)"
             f" | ΔQ∞ : {test_max_dq_pu:.4e} pu ({test_max_dq_mva:.4e} MVAr)"
         )
+        print(format_residual_distribution_full(test_residual_dist, tol_pu=args.residual_tol_pu))
     else:
         print(
             f"\nFinal test-set RMSE : {test_rmse:.4e}"

@@ -1,0 +1,206 @@
+\documentclass{article}
+
+\usepackage[preprint]{neurips_2026}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{hyperref}
+\usepackage{url}
+\usepackage{booktabs}
+\usepackage{amsfonts}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{nicefrac}
+\usepackage{microtype}
+\usepackage{xcolor}
+\usepackage{graphicx}
+\usepackage{enumitem}
+
+\title{Physics-Informed Loss Formulations for Unrolled Power Flow Solvers}
+
+\author{%
+  Changhun Kim \\
+  \texttt{}
+}
+
+\begin{document}
+
+\maketitle
+
+\section{Physics Loss Formulations}
+
+\subsection{Default Physics Loss (MSE, No Normalization)}
+
+The default physics loss is selected with:
+
+\begin{verbatim}
+--physics_loss_form mse
+--physics_residual_norm none
+--physics_final_weight 0.0
+\end{verbatim}
+
+Mathematically, this computes:
+
+\begin{equation}
+  \mathcal{L}_{\mathrm{phys}}
+  =
+  \sum_{k=0}^{K-1}
+  \gamma^{K-1-k}
+  \frac{1}{N}
+  \sum_i
+  \left[
+    (\Delta P_i^{(k)})^2
+    +
+    (\Delta Q_i^{(k)})^2
+  \right]
+\end{equation}
+
+Slack/PV masking is applied in the implementation:
+\begin{itemize}[noitemsep]
+  \item $\Delta P$ is used for PV and PQ buses.
+  \item $\Delta Q$ is used only for PQ buses.
+\end{itemize}
+
+%------------------------------------------------------------------------------
+\section{Residual Normalization}
+
+Instead of training directly on raw $\Delta P_i,\,\Delta Q_i$, we can
+normalize them before applying the loss.
+
+\subsection{Setpoint Normalization}
+
+Activated with \texttt{--physics\_residual\_norm setpoint}.
+
+\begin{equation}
+  s_i = \max\!\bigl(|S_i^{\mathrm{set}}|,\,\epsilon\bigr),
+  \qquad
+  |S_i^{\mathrm{set}}| = \sqrt{(P_i^{\mathrm{set}})^2 + (Q_i^{\mathrm{set}})^2}
+\end{equation}
+
+\begin{equation}
+  \widetilde{\Delta P}_i^{(k)}
+  =
+  \frac{\Delta P_i^{(k)}}{s_i},
+  \qquad
+  \widetilde{\Delta Q}_i^{(k)}
+  =
+  \frac{\Delta Q_i^{(k)}}{s_i}
+\end{equation}
+
+\subsection{Graph Normalization}
+
+Activated with \texttt{--physics\_residual\_norm graph}.
+
+For each graph $g$, compute the global scale:
+\begin{equation}
+  s_g = \max_i |S_i^{\mathrm{set}}|
+\end{equation}
+
+Then normalize all buses in that graph:
+\begin{equation}
+  \widetilde{\Delta P}_i^{(k)}
+  =
+  \frac{\Delta P_i^{(k)}}{s_g},
+  \qquad
+  \widetilde{\Delta Q}_i^{(k)}
+  =
+  \frac{\Delta Q_i^{(k)}}{s_g}
+\end{equation}
+
+The purpose of both normalization modes is to prevent very large-load or
+badly-scaled buses from dominating the total loss.
+
+%------------------------------------------------------------------------------
+\section{Selectable Loss Form}
+
+After residual normalization, the residual vector at step $k$ is:
+\begin{equation}
+  r^{(k)}
+  =
+  \bigl[
+    \widetilde{\Delta P}^{(k)},\;
+    \widetilde{\Delta Q}^{(k)}
+  \bigr]
+\end{equation}
+
+We then choose a penalty function $\rho(r)$.
+
+\subsection{MSE (\texttt{--physics\_loss\_form mse})}
+
+\begin{equation}
+  \rho(r) = r^2,
+  \qquad
+  \mathcal{L}_k = \frac{1}{M}\sum_j \bigl(r_j^{(k)}\bigr)^2
+\end{equation}
+
+\subsection{Huber (\texttt{--physics\_loss\_form huber})}
+
+\begin{equation}
+  \rho_\delta(r)
+  =
+  \begin{cases}
+    \dfrac{1}{2}r^2, & |r| \le \delta \\[6pt]
+    \delta\!\left(|r|-\dfrac{1}{2}\delta\right), & |r| > \delta
+  \end{cases}
+\end{equation}
+
+Behaves like MSE near zero and like $\ell_1$ for large residuals, so
+extreme buses dominate less.
+
+\subsection{Log-Cosh (\texttt{--physics\_loss\_form logcosh})}
+
+\begin{equation}
+  \rho(r) = \log(\cosh(r))
+  \approx
+  \begin{cases}
+    \dfrac{1}{2}r^2 & \text{for small } |r| \\[4pt]
+    |r| - \log 2   & \text{for large } |r|
+  \end{cases}
+\end{equation}
+
+Also robust to outliers, with a smooth transition between quadratic and
+linear regimes.
+
+%------------------------------------------------------------------------------
+\section{Final Residual Penalty}
+
+The base loss sums over the $K$ unrolled steps:
+\begin{equation}
+  \sum_{k=0}^{K-1}
+  \gamma^{K-1-k}
+  \mathcal{L}_k
+\end{equation}
+
+We can additionally penalize the mismatch at the final predicted voltage
+directly with \texttt{--physics\_final\_weight}~$\lambda$:
+
+\begin{equation}
+  \mathcal{L}_{\mathrm{total}}
+  =
+  \sum_{k=0}^{K-1}
+  \gamma^{K-1-k}
+  \mathcal{L}_k
+  \;+\;
+  \lambda\,\mathcal{L}_{\mathrm{final}}
+\end{equation}
+
+where
+
+\begin{equation}
+  \mathcal{L}_{\mathrm{final}}
+  =
+  \frac{1}{M}
+  \sum_j
+  \rho\!\left(r_j^{(K)}\right)
+\end{equation}
+
+Setting \texttt{--physics\_final\_weight 1.0} forces the final predicted
+voltage to directly minimize the power mismatch, not only the intermediate
+unrolled states.
+
+\paragraph{Important.}
+Reporting metrics always use raw residuals $\Delta P,\,\Delta Q$ in
+pu\,/\,MW\,/\,MVAr.  Normalization affects only the training loss, not
+evaluation.
+
+\end{document}

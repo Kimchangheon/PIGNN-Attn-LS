@@ -277,6 +277,13 @@ class GNSMsg_EdgeSelfAttn(nn.Module):
         armijo_c1: float = 1e-4,
         armijo_max_backtracks: int = 5,
         armijo_min_alpha: float = 0.0625,
+        dtheta_max: float = 0.30,
+        dvm_frac: float = 0.10,
+        physics_loss_form: str = "mse",
+        physics_residual_norm: str = "none",
+        physics_norm_eps: float = 1e-6,
+        physics_huber_delta: float = 1.0,
+        physics_final_weight: float = 0.0,
     ):
         super().__init__()
         self.K = K
@@ -291,6 +298,13 @@ class GNSMsg_EdgeSelfAttn(nn.Module):
         self.armijo_c1 = armijo_c1
         self.armijo_max_backtracks = armijo_max_backtracks
         self.armijo_min_alpha = armijo_min_alpha
+        self.dtheta_max = dtheta_max
+        self.dvm_frac = dvm_frac
+        self.physics_loss_form = physics_loss_form
+        self.physics_residual_norm = physics_residual_norm
+        self.physics_norm_eps = physics_norm_eps
+        self.physics_huber_delta = physics_huber_delta
+        self.physics_final_weight = physics_final_weight
 
         self.d_model = d_model if d_model is not None else d_hi
         self.n_heads = n_heads
@@ -320,6 +334,61 @@ class GNSMsg_EdgeSelfAttn(nn.Module):
             nn.init.zeros_(self.theta_head[k].weight); nn.init.zeros_(self.theta_head[k].bias)
             nn.init.zeros_(self.v_head[k].weight);     nn.init.zeros_(self.v_head[k].bias)
             nn.init.zeros_(self.m_head[k].weight);     nn.init.zeros_(self.m_head[k].bias)
+
+    def _graph_scale_from_s(self, S_abs, n_nodes_per_graph):
+        if n_nodes_per_graph is None:
+            return S_abs.amax(dim=-1, keepdim=True).clamp_min(self.physics_norm_eps)
+
+        scales = torch.empty_like(S_abs)
+        offset = 0
+        for size in n_nodes_per_graph.tolist():
+            size = int(size)
+            sl = slice(offset, offset + size)
+            scale = S_abs[:, sl].amax(dim=-1, keepdim=True).clamp_min(self.physics_norm_eps)
+            scales[:, sl] = scale
+            offset += size
+        return scales
+
+    def _physics_residual_loss(self, DP, DQ, P_set, Q_set, p_mask, q_mask, n_nodes_per_graph):
+        if self.physics_residual_norm == "none":
+            if self.physics_loss_form == "mse":
+                return (DP ** 2 + DQ ** 2).mean()
+            residual = torch.cat([DP.reshape(-1), DQ.reshape(-1)])
+        else:
+            S_abs = torch.sqrt(P_set ** 2 + Q_set ** 2)
+            if self.physics_residual_norm == "setpoint":
+                scale = S_abs.clamp_min(self.physics_norm_eps)
+            elif self.physics_residual_norm == "graph":
+                scale = self._graph_scale_from_s(S_abs, n_nodes_per_graph)
+            else:
+                raise ValueError(
+                    f"Unknown physics_residual_norm={self.physics_residual_norm!r}; "
+                    "expected 'none', 'setpoint', or 'graph'."
+                )
+
+            residual = torch.cat([
+                (DP / scale)[p_mask],
+                (DQ / scale)[q_mask],
+            ])
+            if residual.numel() == 0:
+                return DP.sum() * 0.0
+
+        if self.physics_loss_form == "mse":
+            return (residual ** 2).mean()
+        if self.physics_loss_form == "huber":
+            return F.huber_loss(
+                residual,
+                torch.zeros_like(residual),
+                delta=self.physics_huber_delta,
+                reduction="mean",
+            )
+        if self.physics_loss_form == "logcosh":
+            return (residual + F.softplus(-2.0 * residual) - math.log(2.0)).mean()
+
+        raise ValueError(
+            f"Unknown physics_loss_form={self.physics_loss_form!r}; "
+            "expected 'mse', 'huber', or 'logcosh'."
+        )
 
     def forward(
         self,
@@ -431,6 +500,8 @@ class GNSMsg_EdgeSelfAttn(nn.Module):
 
         slack_mask = (bus_type == 1)
         pv_mask = (bus_type == 2)
+        p_mask = ~slack_mask
+        q_mask = ~(slack_mask | pv_mask)
 
         phys_terms = []
 
@@ -473,11 +544,9 @@ class GNSMsg_EdgeSelfAttn(nn.Module):
             dv  = dv.masked_fill(slack_mask | pv_mask, 0.0)
 
             if self.v_limit:
-                dtheta_max = 0.30
-                dvm_frac = 0.10
                 v_abs = v.abs()
-                dth = torch.clamp(dth, -dtheta_max, dtheta_max)
-                dv = torch.clamp(dv, -dvm_frac * v_abs, dvm_frac * v_abs)
+                dth = torch.clamp(dth, -self.dtheta_max, self.dtheta_max)
+                dv = torch.clamp(dv, -self.dvm_frac * v_abs, self.dvm_frac * v_abs)
 
             if self.use_armijo:
                 v_min, v_max = 0.75, 1.20
@@ -539,12 +608,24 @@ class GNSMsg_EdgeSelfAttn(nn.Module):
                 m = m + dm
 
             if self.pinn:
-                term = (self.gamma ** (self.K - 1 - k)) * ((DP ** 2 + DQ ** 2).mean())
+                term = (self.gamma ** (self.K - 1 - k)) * self._physics_residual_loss(
+                    DP, DQ, P_set, Q_set, p_mask, q_mask, n_nodes_per_graph
+                )
                 phys_terms.append(term)
 
         out = torch.stack([v, th], dim=-1)
 
         if self.pinn:
+            if self.physics_final_weight != 0.0:
+                Vc = v * torch.exp(1j * th)
+                Ic = torch.matmul(Y, Vc.unsqueeze(-1)).squeeze(-1)
+                Sc = Vc * Ic.conj()
+                DP = (P_set - Sc.real).masked_fill(slack_mask, 0.0)
+                DQ = (Q_set - Sc.imag).masked_fill(slack_mask | pv_mask, 0.0)
+                final_term = self._physics_residual_loss(
+                    DP, DQ, P_set, Q_set, p_mask, q_mask, n_nodes_per_graph
+                )
+                phys_terms.append(self.physics_final_weight * final_term)
             phys_loss = torch.sum(torch.stack(phys_terms))
             return out, phys_loss
         else:
