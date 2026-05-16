@@ -12,6 +12,7 @@ from torch.utils.data import DataLoader, random_split
 from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
 
 from GNSMsg_SelfAttention_armijo import GNSMsg_EdgeSelfAttn
+from GNSMsg_SelfAttention_armijo_khop import GNSMsg_EdgeSelfAttnKHop
 from GNSMsg_armijo import GNSMsg   # adapt separately if you still want the non-attention baseline
 
 from Dataset_optimized_complex_columns import ChanghunDataset
@@ -37,11 +38,20 @@ parser.add_argument("--float64", action="store_true")
 parser.add_argument('--mode', type=str, default="train_test", help='train_valid_test | train | valid | test')
 parser.add_argument("--mag_ang_mse", action="store_true", help="Use |V| + wrapped-angle reporting")
 
-parser.add_argument('--model', type=str, default="GNSMsg_EdgeSelfAttn", help='GNSMsg_EdgeSelfAttn')
+parser.add_argument(
+    '--model',
+    type=str,
+    default="GNSMsg_EdgeSelfAttn",
+    help='GNSMsg_EdgeSelfAttn | GNSMsg_EdgeSelfAttnKHop',
+)
 parser.add_argument("--d", type=int, default=4)
 parser.add_argument("--d_hi", type=int, default=16)
 parser.add_argument("--num_attn_layers", type=int, default=1)
 parser.add_argument("--n_heads", type=int, default=4)
+parser.add_argument("--khop_K", type=int, default=3)
+parser.add_argument("--khop_sigma", type=float, default=1.5)
+parser.add_argument("--khop_norm", type=str, default="row", choices=("row", "sym", "col"))
+parser.add_argument("--khop_source", type=str, default="yabs", choices=("yabs", "adj"))
 
 parser.add_argument("--K", type=int, default=40)
 parser.add_argument('--gamma', type=float, default=0.9)
@@ -171,6 +181,13 @@ RUNNAME = (
     f"_nheads{args.n_heads}_numattn{args.num_attn_layers}"
     f"_armijo{armijo_tag}{loss_tag}_ep{args.EPOCHS}_TrainRatio{args.train_ratio}"
 )
+if args.model == "GNSMsg_EdgeSelfAttnKHop":
+    RUNNAME = (
+        f"{parquet_filename}_solverK{args.K}_khop{args.khop_K}_sigma{args.khop_sigma:g}"
+        f"_khop{args.khop_norm}_{args.khop_source}_d{args.d}_dhi{args.d_hi}"
+        f"_nheads{args.n_heads}_numattn{args.num_attn_layers}"
+        f"_armijo{armijo_tag}{loss_tag}_ep{args.EPOCHS}_TrainRatio{args.train_ratio}"
+    )
 BEST_CKPT_PATH = f"./results/ckpt/{RUNNAME}_{EPOCHS}_best_model.ckpt"
 if args.log_to_file:
     os.makedirs(args.log_dir, exist_ok=True)
@@ -207,7 +224,9 @@ print(
     f"no_cache_dense_ybus:{args.no_cache_dense_ybus}, lazy_parquet:{args.lazy_parquet}, "
     f"row_group_cache_size:{args.row_group_cache_size}, "
     f"physics_loss_form:{args.physics_loss_form}, physics_residual_norm:{args.physics_residual_norm}, "
-    f"physics_final_weight:{args.physics_final_weight}, DthetaMax:{args.DthetaMax}, DvmFrac:{args.DvmFrac}"
+    f"physics_final_weight:{args.physics_final_weight}, DthetaMax:{args.DthetaMax}, DvmFrac:{args.DvmFrac}, "
+    f"khop_K:{args.khop_K}, khop_sigma:{args.khop_sigma}, "
+    f"khop_norm:{args.khop_norm}, khop_source:{args.khop_source}"
 )
 
 
@@ -345,6 +364,35 @@ elif args.model == "GNSMsg_EdgeSelfAttn":
         physics_norm_eps=args.physics_norm_eps,
         physics_huber_delta=args.physics_huber_delta,
         physics_final_weight=args.physics_final_weight,
+    ).to(device)
+
+elif args.model == "GNSMsg_EdgeSelfAttnKHop":
+    model = GNSMsg_EdgeSelfAttnKHop(
+        d=d,
+        d_hi=d_hi,
+        n_heads=n_heads,
+        K=K,
+        pinn=PINN,
+        gamma=GAMMA,
+        v_limit=VLIMIT,
+        use_armijo=args.use_armijo,
+        num_attn_layers=args.num_attn_layers,
+        armijo_mode=args.armijo_mode,
+        armijo_rho=args.armijo_rho,
+        armijo_c1=args.armijo_c1,
+        armijo_max_backtracks=args.armijo_max_backtracks,
+        armijo_min_alpha=args.armijo_min_alpha,
+        dtheta_max=args.DthetaMax,
+        dvm_frac=args.DvmFrac,
+        physics_loss_form=args.physics_loss_form,
+        physics_residual_norm=args.physics_residual_norm,
+        physics_norm_eps=args.physics_norm_eps,
+        physics_huber_delta=args.physics_huber_delta,
+        physics_final_weight=args.physics_final_weight,
+        khop_K=args.khop_K,
+        khop_sigma=args.khop_sigma,
+        khop_norm=args.khop_norm,
+        khop_source=args.khop_source,
     ).to(device)
 
 else:

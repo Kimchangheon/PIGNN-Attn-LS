@@ -19,8 +19,7 @@
 \title{Physics-Informed Loss Formulations for Unrolled Power Flow Solvers}
 
 \author{%
-  Changhun Kim \\
-  \texttt{}
+  Changhun Kim
 }
 
 \begin{document}
@@ -39,7 +38,11 @@ The default physics loss is selected with:
 --physics_final_weight 0.0
 \end{verbatim}
 
-Mathematically, this computes:
+All quantities are in \textbf{per-unit} (the dataset always normalizes by
+$S_{\mathrm{base}}$, $U_{\mathrm{base}}$).
+
+This combination activates a fast path in the implementation that directly
+returns:
 
 \begin{equation}
   \mathcal{L}_{\mathrm{phys}}
@@ -55,26 +58,38 @@ Mathematically, this computes:
   \right]
 \end{equation}
 
-Slack/PV masking is applied in the implementation:
+where the slack/PV masking is applied \emph{before} the sum:
 \begin{itemize}[noitemsep]
-  \item $\Delta P$ is used for PV and PQ buses.
-  \item $\Delta Q$ is used only for PQ buses.
+  \item $\Delta P_i$ is zeroed for the slack bus.
+  \item $\Delta Q_i$ is zeroed for the slack bus and all PV buses.
 \end{itemize}
+
+Note: in this fast path the masked residuals are not filtered out; they
+are set to zero and included in the mean, so $N$ is the total bus count.
 
 %------------------------------------------------------------------------------
 \section{Residual Normalization}
 
-Instead of training directly on raw $\Delta P_i,\,\Delta Q_i$, we can
-normalize them before applying the loss.
-
-\subsection{Setpoint Normalization}
-
-Activated with \texttt{--physics\_residual\_norm setpoint}.
+When \texttt{--physics\_residual\_norm} is not \texttt{none}, the code
+first computes the per-bus apparent power magnitude from the scheduled
+injections:
 
 \begin{equation}
-  s_i = \max\!\bigl(|S_i^{\mathrm{set}}|,\,\epsilon\bigr),
-  \qquad
   |S_i^{\mathrm{set}}| = \sqrt{(P_i^{\mathrm{set}})^2 + (Q_i^{\mathrm{set}})^2}
+\end{equation}
+
+The masked residuals are then normalized, concatenated into a flat vector
+$r^{(k)}$, and passed to the chosen loss function.  Only the \emph{active}
+entries enter the mean: slack-bus $\Delta P$ and slack/PV-bus $\Delta Q$
+entries are dropped, not zeroed.
+
+\subsection{Setpoint Normalization (\texttt{--physics\_residual\_norm setpoint})}
+
+Each bus is scaled by its own apparent-power setpoint, with a floor of
+$\epsilon = 10^{-6}$ (p.u.) to guard against zero-injection buses:
+
+\begin{equation}
+  s_i = \max\!\bigl(|S_i^{\mathrm{set}}|,\;\epsilon\bigr)
 \end{equation}
 
 \begin{equation}
@@ -87,16 +102,20 @@ Activated with \texttt{--physics\_residual\_norm setpoint}.
   \frac{\Delta Q_i^{(k)}}{s_i}
 \end{equation}
 
-\subsection{Graph Normalization}
+This measures \emph{relative} mismatch: a 0.5 p.u.\ error on a 100 p.u.\
+generator and on a 1 p.u.\ load contribute equally.
 
-Activated with \texttt{--physics\_residual\_norm graph}.
+\subsection{Graph Normalization (\texttt{--physics\_residual\_norm graph})}
 
-For each graph $g$, compute the global scale:
+All buses in the same graph share a single scale equal to the maximum
+apparent power in that graph (also floored at $\epsilon$):
+
 \begin{equation}
-  s_g = \max_i |S_i^{\mathrm{set}}|
+  s_g = \max_{i \in g}\,|S_i^{\mathrm{set}}|
+  \quad
+  \text{(clipped to } \geq \epsilon\text{)}
 \end{equation}
 
-Then normalize all buses in that graph:
 \begin{equation}
   \widetilde{\Delta P}_i^{(k)}
   =
@@ -107,29 +126,29 @@ Then normalize all buses in that graph:
   \frac{\Delta Q_i^{(k)}}{s_g}
 \end{equation}
 
-The purpose of both normalization modes is to prevent very large-load or
-badly-scaled buses from dominating the total loss.
+The purpose is weaker than setpoint normalization: it puts all buses on the
+same order of magnitude without trying to equalize small and large buses.
 
 %------------------------------------------------------------------------------
 \section{Selectable Loss Form}
 
-After residual normalization, the residual vector at step $k$ is:
+After residual normalization (or in the non-\texttt{none} path), the
+active residuals are collected into a flat vector:
+
 \begin{equation}
   r^{(k)}
   =
   \bigl[
-    \widetilde{\Delta P}^{(k)},\;
-    \widetilde{\Delta Q}^{(k)}
+    \widetilde{\Delta P}^{(k)}_{\text{active}},\;
+    \widetilde{\Delta Q}^{(k)}_{\text{active}}
   \bigr]
 \end{equation}
 
-We then choose a penalty function $\rho(r)$.
+and a penalty $\rho$ is applied element-wise.
 
 \subsection{MSE (\texttt{--physics\_loss\_form mse})}
 
 \begin{equation}
-  \rho(r) = r^2,
-  \qquad
   \mathcal{L}_k = \frac{1}{M}\sum_j \bigl(r_j^{(k)}\bigr)^2
 \end{equation}
 
@@ -144,13 +163,24 @@ We then choose a penalty function $\rho(r)$.
   \end{cases}
 \end{equation}
 
-Behaves like MSE near zero and like $\ell_1$ for large residuals, so
-extreme buses dominate less.
+The threshold $\delta$ is set with \texttt{--physics\_huber\_delta}
+(default $1.0$).  Behaves like MSE near zero and like $\ell_1$ for large
+residuals, so extreme buses dominate the gradient less.
 
 \subsection{Log-Cosh (\texttt{--physics\_loss\_form logcosh})}
 
+Implemented in a numerically stable form:
+
 \begin{equation}
-  \rho(r) = \log(\cosh(r))
+  \rho(r)
+  = r + \log\!\bigl(1 + e^{-2r}\bigr) - \log 2
+  = \log(\cosh(r))
+\end{equation}
+
+which approximates:
+
+\begin{equation}
+  \log(\cosh(r))
   \approx
   \begin{cases}
     \dfrac{1}{2}r^2 & \text{for small } |r| \\[4pt]
@@ -158,49 +188,37 @@ extreme buses dominate less.
   \end{cases}
 \end{equation}
 
-Also robust to outliers, with a smooth transition between quadratic and
-linear regimes.
-
 %------------------------------------------------------------------------------
 \section{Final Residual Penalty}
 
-The base loss sums over the $K$ unrolled steps:
+The base loss sums discounted per-step terms:
+
 \begin{equation}
+  \mathcal{L}_{\mathrm{base}}
+  =
   \sum_{k=0}^{K-1}
   \gamma^{K-1-k}
   \mathcal{L}_k
 \end{equation}
 
-We can additionally penalize the mismatch at the final predicted voltage
-directly with \texttt{--physics\_final\_weight}~$\lambda$:
+When \texttt{--physics\_final\_weight}~$\lambda \neq 0$, the mismatch of
+the \emph{final} output voltage is recomputed and appended:
 
 \begin{equation}
   \mathcal{L}_{\mathrm{total}}
   =
-  \sum_{k=0}^{K-1}
-  \gamma^{K-1-k}
-  \mathcal{L}_k
+  \mathcal{L}_{\mathrm{base}}
   \;+\;
   \lambda\,\mathcal{L}_{\mathrm{final}}
 \end{equation}
 
-where
+where $\mathcal{L}_{\mathrm{final}}$ is computed with the same
+normalization and loss form as the unrolled terms.  Importantly, it is
+\emph{not} weighted by $\gamma$; it enters the sum with coefficient
+$\lambda$ directly.
 
-\begin{equation}
-  \mathcal{L}_{\mathrm{final}}
-  =
-  \frac{1}{M}
-  \sum_j
-  \rho\!\left(r_j^{(K)}\right)
-\end{equation}
-
-Setting \texttt{--physics\_final\_weight 1.0} forces the final predicted
-voltage to directly minimize the power mismatch, not only the intermediate
-unrolled states.
-
-\paragraph{Important.}
-Reporting metrics always use raw residuals $\Delta P,\,\Delta Q$ in
-pu\,/\,MW\,/\,MVAr.  Normalization affects only the training loss, not
-evaluation.
+\paragraph{Reporting.}
+Training metrics report raw (un-normalized) $\Delta P,\,\Delta Q$ in
+per-unit.  Normalization affects only the gradient signal, not evaluation.
 
 \end{document}
