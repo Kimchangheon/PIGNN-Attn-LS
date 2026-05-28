@@ -1,0 +1,74 @@
+# LVN training config for PIGNN-Attn-LS (VnFeat variant).
+#
+# Matches the documented production launch command in docs/lvn_results.md of
+# the parent repo (PIGNN-Attn-LS_VnFeat on LVN_converted_n36000_v2.parquet).
+# Pass any field on the CLI to override.
+
+run:
+  name: null
+  mode: train_test          # train_test | train | valid | test
+  seed: 42
+
+split:
+  mode: ratio               # ratio | equal3
+  train_ratio: 0.8
+  valid_ratio: 0.1
+
+data:
+  parquet_paths:
+    - ./datasets/LVN_converted_n36000_v2.parquet
+  per_unit: true
+
+flags:
+  pinn: true
+  block_diag: true
+  normalize: false
+  mag_ang_mse: true
+  float64: false
+
+model:
+  # VnFeat = adds a per-bus vn_log scalar so the model can distinguish
+  # voltage classes (3kV / 20kV / 110kV / 380kV) in multi-voltage LVN grids.
+  # The dataset class populates vn_log automatically from the parquet column.
+  name: GNSMsg_EdgeSelfAttn_VnFeat
+  d: 4
+  d_hi: 16
+  num_attn_layers: 1
+  K: 10
+  gamma: 0.9
+  vlimit: true
+  use_armijo: true
+  DthetaMax: 0.30
+  DvmFrac: 0.10
+
+train:
+  batch_size: 32
+  epochs: 30
+  lr: 1.0e-4
+  val_every: 1
+
+optimizer:
+  weight_init: sd0.02
+  bias_init: 0.0
+  weight_decay: 1.0e-3
+  lr_scheduler: CosineAnnealingLR
+  cosine_restart_epoch: 20
+
+misc:
+  adj_mode: cplx
+
+# PEFT/LoRA plumbing exists (parent repo uses it for HVN->LVN adaptation)
+# but is off here -- this config trains from scratch on LVN.
+peft:
+  enabled: false
+
+# MLflow off by default for a clean standalone run. Flip enabled: true and
+# point tracking_uri at sqlite:///results/mlflow.db (or your server) to log.
+mlflow:
+  enabled: false
+  tracking_uri: sqlite:///results/mlflow.db
+  artifact_location: file:./results/mlruns
+  experiment: lvn_pignn_attn_ls
+  artifact_path: run
+  keep_local_run_dir: true
+  strict: false

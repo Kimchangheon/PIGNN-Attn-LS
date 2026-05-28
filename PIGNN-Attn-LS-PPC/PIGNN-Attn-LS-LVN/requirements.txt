@@ -1,0 +1,19 @@
+# Runtime deps for the PIGNN-Attn-LS / LVN standalone bundle.
+#
+# Torch + torch_scatter are pinned by the user's CUDA toolchain and are NOT
+# installed by this file (they need a wheel matched to your CUDA / Python
+# version). Install them manually first:
+#
+#   pip install torch==2.4.* --index-url https://download.pytorch.org/whl/cu121
+#   pip install torch-scatter -f https://data.pyg.org/whl/torch-2.4.0+cu121.html
+#
+# CPU-only is also fine; pick the matching --index-url / wheel URL.
+
+numpy<2
+pandas>=2.3.3
+pyarrow>=12,<23
+pyyaml>=6.0.1
+rich>=13.7.1
+matplotlib>=3.10.8
+scipy>=1.15.3
+mlflow>=2.12.0

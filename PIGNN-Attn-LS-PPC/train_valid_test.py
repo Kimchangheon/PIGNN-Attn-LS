@@ -8,7 +8,7 @@ import numpy as np
 
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader, Subset, random_split
 from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
 
 from GNSMsg_SelfAttention_armijo import GNSMsg_EdgeSelfAttn
@@ -71,6 +71,9 @@ parser.add_argument("--physics_huber_delta", type=float, default=1.0)
 parser.add_argument("--physics_final_weight", type=float, default=0.0)
 parser.add_argument('--train_ratio', type=float, default=0.3333)
 parser.add_argument('--valid_ratio', type=float, default=0.3333)
+parser.add_argument("--max_train_samples", type=int, default=0, help="Cap train split size after random split; 0 disables")
+parser.add_argument("--max_valid_samples", type=int, default=0, help="Cap valid split size after random split; 0 disables")
+parser.add_argument("--max_test_samples", type=int, default=0, help="Cap test split size after random split; 0 disables")
 
 parser.add_argument('--weight_init', type=str, default="sd0.02")
 parser.add_argument('--bias_init', type=float, default=0.0)
@@ -84,6 +87,11 @@ parser.add_argument("--EPOCHS", type=int, default=20)
 parser.add_argument("--LR", type=float, default=1e-4)
 parser.add_argument("--VAL_EVERY", type=int, default=1)
 parser.add_argument("--residual_tol_pu", type=float, default=1e-6)
+parser.add_argument(
+    "--skip_initial_eval",
+    action="store_true",
+    help="Skip the full train/valid evaluation before epoch 1; useful for large lazy parquet diagnostics",
+)
 
 parser.add_argument("--PARQUET", type=str, nargs='+', required=True, help="Path to parquet data file(s)")
 parser.add_argument("--seed_value", type=int, default=42)
@@ -260,31 +268,41 @@ train_ds, val_ds, test_ds = random_split(
     generator=torch.Generator().manual_seed(SEED)
 )
 
-if BATCH == 1:
-    train_loader = DataLoader(train_ds, batch_size=BATCH, shuffle=True)
-    val_loader   = DataLoader(val_ds,   batch_size=BATCH, shuffle=False)
-    test_loader  = DataLoader(test_ds,  batch_size=BATCH, shuffle=False)
+def cap_subset(split, max_samples: int):
+    if max_samples is None or max_samples <= 0 or len(split) <= max_samples:
+        return split
+    return Subset(split.dataset, split.indices[:max_samples])
+
+train_ds = cap_subset(train_ds, args.max_train_samples)
+val_ds = cap_subset(val_ds, args.max_valid_samples)
+test_ds = cap_subset(test_ds, args.max_test_samples)
+n_train, n_val, n_test = len(train_ds), len(val_ds), len(test_ds)
+
+if BLOCK_DIAG:
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=BATCH,
+        shuffle=True,
+        collate_fn=collate_blockdiag
+    )
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=BATCH,
+        shuffle=False,
+        collate_fn=collate_blockdiag
+    )
+    test_loader = DataLoader(
+        test_ds,
+        batch_size=BATCH,
+        shuffle=False,
+        collate_fn=collate_blockdiag
+    )
 
 else:
-    if BLOCK_DIAG:
-        train_loader = DataLoader(
-            train_ds,
-            batch_size=BATCH,
-            shuffle=True,
-            collate_fn=collate_blockdiag
-        )
-        val_loader = DataLoader(
-            val_ds,
-            batch_size=BATCH,
-            shuffle=False,
-            collate_fn=collate_blockdiag
-        )
-        test_loader = DataLoader(
-            test_ds,
-            batch_size=BATCH,
-            shuffle=False,
-            collate_fn=collate_blockdiag
-        )
+    if BATCH == 1:
+        train_loader = DataLoader(train_ds, batch_size=BATCH, shuffle=True)
+        val_loader   = DataLoader(val_ds,   batch_size=BATCH, shuffle=False)
+        test_loader  = DataLoader(test_ds,  batch_size=BATCH, shuffle=False)
 
     else:
         # Non-blockdiag batching requires homogeneous tensor shapes.
@@ -893,47 +911,50 @@ if "train" in args.mode:
 
     best_val_loss = float('inf')
 
-    print("Initial metrics before training:")
-    (
-        train_loss,
-        train_mse,
-        train_mse_mag,
-        train_mse_ang,
-        train_max_dp_pu,
-        train_max_dq_pu,
-        _train_max_dp_mva,
-        _train_max_dq_mva,
-        _train_residual_dist,
-    ) = run_epoch(train_loader, train=False, pinn=PINN)
-    train_rmse = math.sqrt(train_mse)
-    train_rmse_mag = math.sqrt(train_mse_mag)
-    train_rmse_ang_deg = math.sqrt(train_mse_ang) * (180.0 / math.pi)
+    if args.skip_initial_eval:
+        print("Initial metrics before training: skipped (--skip_initial_eval)")
+    else:
+        print("Initial metrics before training:")
+        (
+            train_loss,
+            train_mse,
+            train_mse_mag,
+            train_mse_ang,
+            train_max_dp_pu,
+            train_max_dq_pu,
+            _train_max_dp_mva,
+            _train_max_dq_mva,
+            _train_residual_dist,
+        ) = run_epoch(train_loader, train=False, pinn=PINN)
+        train_rmse = math.sqrt(train_mse)
+        train_rmse_mag = math.sqrt(train_mse_mag)
+        train_rmse_ang_deg = math.sqrt(train_mse_ang) * (180.0 / math.pi)
 
-    (
-        val_loss,
-        val_mse,
-        val_mse_mag,
-        val_mse_ang,
-        val_max_dp_pu,
-        val_max_dq_pu,
-        _val_max_dp_mva,
-        _val_max_dq_mva,
-        val_residual_dist,
-    ) = run_epoch(val_loader, train=False, pinn=PINN)
-    val_rmse = math.sqrt(val_mse)
-    val_rmse_mag = math.sqrt(val_mse_mag)
-    val_rmse_ang_deg = math.sqrt(val_mse_ang) * (180.0 / math.pi)
+        (
+            val_loss,
+            val_mse,
+            val_mse_mag,
+            val_mse_ang,
+            val_max_dp_pu,
+            val_max_dq_pu,
+            _val_max_dp_mva,
+            _val_max_dq_mva,
+            val_residual_dist,
+        ) = run_epoch(val_loader, train=False, pinn=PINN)
+        val_rmse = math.sqrt(val_mse)
+        val_rmse_mag = math.sqrt(val_mse_mag)
+        val_rmse_ang_deg = math.sqrt(val_mse_ang) * (180.0 / math.pi)
 
-    print(
-        f"Epoch   0 | "
-        f"train loss {train_loss:.4e}  rmse {train_rmse:.4e} "
-        f"(mag {train_rmse_mag:.4e}, ang {train_rmse_ang_deg:.4e}°) "
-        f"{format_residual_summary(train_max_dp_pu, train_max_dq_pu)} | "
-        f"valid loss {val_loss:.4e}  rmse {val_rmse:.4e} "
-        f"(mag {val_rmse_mag:.4e}, ang {val_rmse_ang_deg:.4e}°) "
-        f"{format_residual_summary(val_max_dp_pu, val_max_dq_pu)} "
-        f"{format_residual_distribution_compact(val_residual_dist)}"
-    )
+        print(
+            f"Epoch   0 | "
+            f"train loss {train_loss:.4e}  rmse {train_rmse:.4e} "
+            f"(mag {train_rmse_mag:.4e}, ang {train_rmse_ang_deg:.4e}°) "
+            f"{format_residual_summary(train_max_dp_pu, train_max_dq_pu)} | "
+            f"valid loss {val_loss:.4e}  rmse {val_rmse:.4e} "
+            f"(mag {val_rmse_mag:.4e}, ang {val_rmse_ang_deg:.4e}°) "
+            f"{format_residual_summary(val_max_dp_pu, val_max_dq_pu)} "
+            f"{format_residual_distribution_compact(val_residual_dist)}"
+        )
 
     for epoch in range(1, EPOCHS + 1):
         t0 = time.time()

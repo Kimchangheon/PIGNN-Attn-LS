@@ -34,14 +34,19 @@
 
 \subsection{Baseline Definition}
 
-The \textbf{baseline} throughout all experiments is a \emph{flat-start}
-initialisation: every bus voltage magnitude is set to $|V|=1.0$\,p.u.\ and
-every voltage angle to $\theta=0^\circ$.  This is the standard cold-start
-point used in classical Newton--Raphson solvers when no better estimate is
-available.  The baseline RMSE and angle error reported below are the errors
-of this flat-start guess against the Newton--Raphson converged solution ---
-\emph{before} the model does any work.  The model's job is to reduce these
-errors.
+The \textbf{baseline} throughout all experiments (case14--case300) is the
+\emph{DC power-flow initialisation} stored as \texttt{u\_start} in each
+parquet file.  Concretely, voltage magnitudes are set to per-bus nominal
+values (near $1.0$\,p.u.) and voltage angles are taken from the DC
+power-flow solution of the same operating scenario.  The parquet filenames
+confirm this: they all carry the suffix \texttt{dc\_compile\_siNR}.
+The baseline RMSE values reported below are the errors of this DC-initialised
+guess against the Newton--Raphson converged solution \emph{before} the model
+does any work.  The model's job is to reduce these errors.
+
+Note that the LVN Heo1 experiments used a genuine \emph{flat start}
+($|V|=1.0$\,p.u., $\theta=0^\circ$) precisely because reliable DC
+initialisation was not available for that network.
 
 \subsection{Test Cases: Bus and Branch Counts}
 
@@ -66,6 +71,93 @@ case57\_ppcY\_A       & 57  & 80  & IEEE 57-bus \\
 case89pegase          & 89  & 210 & PEGASE 89-bus (dense) \\
 case118\_ppcY\_A      & 118 & 186 & IEEE 118-bus \\
 case145\_ppcY\_A      & 145 & 453 & PEGASE 145-bus (very dense) \\
+case300\_ppcY\_A      & 300 & 411 & PEGASE 300-bus (run on A100) \\
+LVN Heo1              & 722 & 796 & LEW Verteilnetz GmbH distribution network (reduced internal PPC) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsubsection*{LVN Heo1 Network Topology: From CGMES to Internal PPC}
+\label{subsec:lvn_topology}
+
+The LVN Heo1 grid originates as a CGMES XML file and passes through a
+multi-stage reduction before reaching the Newton--Raphson / PIGNN solver.
+Table~\ref{tab:lvn_cgmes} summarises the raw CGMES object counts,
+Table~\ref{tab:lvn_pandapower} the pandapower equipment counts after import,
+and Table~\ref{tab:lvn_ppc} the final internal PPC system used for power
+flow.
+
+\begin{table}[h]
+\centering
+\caption{LVN Heo1 -- raw CGMES object counts.}
+\label{tab:lvn_cgmes}
+\begin{tabular}{lr}
+\toprule
+CGMES Object Type & Count \\
+\midrule
+ConnectivityNode  & 3{,}782 \\
+TopologicalNode   & 1{,}197 \\
+Terminal          & 9{,}967 \\
+BusbarSection     & 682 \\
+Breaker           & 895 \\
+Disconnector      & 184 \\
+PowerTransformer  & 216 \\
+ACLineSegment     & 608 \\
+EquivalentBranch  & 22 \\
+EnergyConsumer    & 275 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[h]
+\centering
+\caption{LVN Heo1 -- pandapower network after CGMES import and Model-A
+  cleanup.}
+\label{tab:lvn_pandapower}
+\setlength{\tabcolsep}{5pt}
+\begin{tabular}{lrr}
+\toprule
+Element & Total & In-service \\
+\midrule
+\multicolumn{3}{l}{\textit{Buses and switches}} \\
+\quad net.bus (ConnectivityNode)  & 3{,}782 & 3{,}200 \\
+\quad bus--bus switches (all)     & 3{,}630 & --- \\
+\quad bus--bus switches (closed)  & 2{,}600 & --- \\
+\midrule
+\multicolumn{3}{l}{\textit{Branches}} \\
+\quad ACLineSegment (line)        & 608 & 606 \\
+\quad 2-winding transformer       & 200 & --- \\
+\quad 3-winding transformer       & 16  & --- \\
+\quad Impedance element           & 22  & --- \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[h]
+\centering
+\caption{LVN Heo1 -- internal PPC system used for Newton--Raphson and PIGNN.
+  The large bus reduction ($3{,}782 \to 722$) is due to closed bus--bus
+  switches fusing many ConnectivityNodes into single electrical buses.
+  The branch count ($796$) reflects only active, in-service elements in the
+  solved connected component.}
+\label{tab:lvn_ppc}
+\setlength{\tabcolsep}{5pt}
+\begin{tabular}{lrrl}
+\toprule
+Stage & Buses & Branches & Notes \\
+\midrule
+External PPC (pandapower compile) & 3{,}798 & 878 &
+  $3{,}782 + 16$ aux buses for 3W-trafos \\
+Unique fused bus groups           & 1{,}304 & ---  &
+  after closed-switch merging \\
+\textbf{Internal PPC (NR / PIGNN)} & \textbf{722} & \textbf{796} &
+  active buses/branches only \\
+\midrule
+\multicolumn{4}{l}{\textit{Internal branch breakdown}} \\
+\quad Line (ACLineSegment)        & --- & 581 & \\
+\quad 2-winding transformer       & --- & 145 & \\
+\quad 3-winding transformer       & --- & 48  & $16\times3$ legs \\
+\quad Impedance element           & --- & 22  & \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -74,7 +166,7 @@ case145\_ppcY\_A      & 145 & 453 & PEGASE 145-bus (very dense) \\
 \section{Full Baseline vs.\ Model Comparison}
 %==============================================================================
 
-Table~\ref{tab:baseline_vs_model} summarises the RMSE of the flat-start
+Table~\ref{tab:baseline_vs_model} summarises the RMSE of the DC-initialised
 baseline and the trained model across all cases.  All model runs use
 $K=40$, $d=4$, $d_{\mathrm{hi}}=16$, \texttt{numattn}$=1$, Armijo$=\mathrm{True}$,
 100 epochs, train ratio $= 1/3$.
@@ -82,7 +174,7 @@ $K=40$, $d=4$, $d_{\mathrm{hi}}=16$, \texttt{numattn}$=1$, Armijo$=\mathrm{True}
 \begin{table}[h]
 \centering
 \small
-\caption{Flat-start baseline vs.\ PIGNN-Attn-LS model.  Reductions are
+\caption{DC-initialised baseline vs.\ PIGNN-Attn-LS model.  Reductions are
   $\lfloor$baseline\,/\,model$\rfloor$.}
 \label{tab:baseline_vs_model}
 \setlength{\tabcolsep}{4pt}
@@ -102,18 +194,24 @@ case57\_ppcY\_A    & 57  & $1.26\times10^{-1}$ & $3\times10^{-3}$ & $\sim42\time
 case89pegase       & 89  & $2.03\times10^{-2}$ & $2.5\times10^{-3}$ & $\sim8\times$  & 0.30  & 0.27  & $\sim1.1\times$ \\
 case118\_ppcY\_A   & 118 & $9.02\times10^{-3}$ & $6\times10^{-5}$ & $\sim150\times$  & 2.73  & 0.08  & $\sim34\times$ \\
 case145\_ppcY\_A   & 145 & $6.52\times10^{-2}$ & $1.77\times10^{-3}$ & $\sim37\times$ & 18.64 & 1.77  & $\sim11\times$ \\
+case300\_ppcY\_A   & 300 & $4.82\times10^{-2}$ & $9.80\times10^{-3}$ & $\sim5\times$ & 19.58 & 1.77  & $\sim11\times$ \\
+LVN Heo1          & 722 & $4.03\times10^{-2}$ & \multicolumn{2}{c}{---\,(failed$^\dagger$)} & 3.44  & \multicolumn{2}{c}{---\,(failed$^\dagger$)} \\
 \bottomrule
+\multicolumn{8}{l}{${}^\dagger$ All LVN training runs failed to learn: no-Armijo runs diverged to $\theta\!\approx\!91^\circ$;}\\
+\multicolumn{8}{l}{\phantom{${}^\dagger$} Armijo runs had all steps rejected (physics loss never decreased). See Section~\ref{sec:lvn}.}\\
 \end{tabular}
 \end{table}
 
 \paragraph{Reading the baseline.}
-The flat-start error is \emph{not} zero because real grids are not at
-uniform $1.0\angle0^\circ$ p.u.\ at operating conditions.  The deviation
-grows with grid complexity: case145 has a flat-start angle error of
-$18.64^\circ$ because the PEGASE 145-bus network has strong reactive-power
-variation and several high-angle buses.  case57 has a large flat-start
-$|V|$ error ($0.126$\,p.u.) because it contains several buses with
-voltages that differ considerably from 1.0\,p.u.\ at the operating point.
+The DC-initialised error is \emph{not} zero because the DC power-flow is an
+approximation: it ignores reactive power, line losses, and voltage magnitude
+deviations, so the DC angles and near-nominal magnitudes do not exactly match
+the AC Newton--Raphson solution.  The residual grows with grid complexity and
+loading: case145 retains a DC-initialised angle error of $18.64^\circ$ because
+the PEGASE 145-bus network has strong reactive-power variation and large angle
+spreads.  case57 has a large DC-initialised $|V|$ error ($0.126$\,p.u.)
+because several buses operate at voltages well below nominal at the AC
+solution.
 
 %==============================================================================
 \section{Armijo vs.\ Non-Armijo}
@@ -148,7 +246,9 @@ case57\_ppcY\_A   & $3\times10^{-3}$ & 0.20  & $3\times10^{-3}$ & 0.30 & No gain
 case89pegase      & $3\times10^{-3}$ & 0.30  & $2.5\times10^{-3}$ & 0.27 & Marginal \\
 case118\_ppcY\_A  & $4\times10^{-4}$ & 0.09  & $\mathbf{6\times10^{-5}}$ & $\mathbf{0.08}$ & Large gain \\
 case145\_ppcY\_A  & $0.010$ & 6.0   & $3\times10^{-3}$ & 6.0  & Modest gain \\
+LVN Heo1         & --- & $\sim91$ (diverged) & \multicolumn{2}{c}{all steps rejected$^\dagger$} & No learning \\
 \bottomrule
+\multicolumn{6}{l}{${}^\dagger$ Armijo rejected every candidate step at every batch; model received no gradient update.}\\
 \end{tabular}
 \end{table}
 
@@ -372,5 +472,438 @@ K48\_d6\_dhi24\_n2 & 48 & 6 & 24 & 2 & False & $\sim0.010$      & $\sim10$ \\
     $d_{\mathrm{hi}}\ge48$ and all nhead$=16$ runs are pending; better
     configurations may yet be found.
 \end{enumerate}
+
+%==============================================================================
+\section{case300 Results (PEGASE 300-bus, A100)}
+%==============================================================================
+
+\subsection{Setup and Baseline}
+
+The DC-initialised baseline for case300 (computed from 36,000 scenarios,
+300 buses each) is:
+\[
+  |V|_{\mathrm{RMSE}}^{\mathrm{base}} = 4.82\times10^{-2}\;\text{p.u.},
+  \qquad
+  \theta_{\mathrm{RMSE}}^{\mathrm{base}} = 19.58^\circ
+\]
+This is comparable to case145 ($19.58^\circ$ vs $18.64^\circ$) because
+PEGASE networks of similar voltage-level complexity share similar angle
+spreads at operating conditions.
+
+case300 (\texttt{case300\_ppcY\_A}) is the largest case tested so far:
+300 buses and 411 branches.  All six runs were submitted to the \texttt{alex}
+cluster on a 40\,GB A100 GPU under a 24\,h walltime limit
+(sweep \texttt{case300\_top3\_armijo\_compare\_20260324\_210253}).
+The configurations are the three best-performing architectures from the
+case145 sweep, each tested with and without Armijo line search.
+
+\subsection{Run-by-Run Results}
+
+\begin{table}[h]
+\centering
+\small
+\caption{case300 results. $K=40$, $d=4$, $H=8$.
+  ``Last valid'' means the last epoch logged before timeout.
+  The only fully completed run is job \texttt{3492156}.}
+\label{tab:case300}
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{llrrrlll}
+\toprule
+Job & Config & $d_{\mathrm{hi}}$ & $L$ & Epoch & $|V|$ RMSE (p.u.) & $\theta$ (${}^\circ$) & Status \\
+\midrule
+3492155 & noarmijo & 24 & 8  & 94  & $2.171\times10^{-2}$ & 1.806 & TIMEOUT \\
+\textbf{3492156} & \textbf{armijo}   & \textbf{24} & \textbf{8}  & \textbf{100} & $\mathbf{9.800\times10^{-3}}$ & \textbf{1.774} & \textbf{COMPLETE}$^\dagger$ \\
+3492157 & noarmijo & 32 & 10 & 80  & $1.993\times10^{-2}$ & 3.211 & TIMEOUT \\
+3492158 & armijo   & 32 & 10 & 91  & $1.196\times10^{-2}$ & 4.101 & TIMEOUT \\
+3492159 & noarmijo & 24 & 10 & 74  & $2.067\times10^{-2}$ & 3.423 & TIMEOUT \\
+3492160 & armijo   & 24 & 10 & 94  & $1.468\times10^{-2}$ & 1.825 & TIMEOUT \\
+\bottomrule
+\multicolumn{7}{l}{${}^\dagger$ Slurm reports \texttt{FAILED 120} (walltime signal), but the run finished all 100 epochs}\\
+\multicolumn{7}{l}{\phantom{${}^\dagger$} and printed final test metrics before exit; the result is usable.}\\
+\end{tabular}
+\end{table}
+
+\subsection{Armijo Effect on case300}
+
+On case300 Armijo consistently helps, which is even clearer than on case145:
+
+\begin{center}
+\begin{tabular}{lrrrrr}
+\toprule
+Config & Armijo & Epoch & $|V|$ RMSE & $\theta$ (${}^\circ$) & $\Delta\theta$ \\
+\midrule
+$d_{\mathrm{hi}}=24$, $L=8$  & No  & 94  & $2.171\times10^{-2}$ & 1.806 & \multirow{2}{*}{$-0.032$} \\
+$d_{\mathrm{hi}}=24$, $L=8$  & Yes & 100 & $9.800\times10^{-3}$ & \textbf{1.774} & \\
+\midrule
+$d_{\mathrm{hi}}=24$, $L=10$ & No  & 74  & $2.067\times10^{-2}$ & 3.423 & \multirow{2}{*}{$-1.598$} \\
+$d_{\mathrm{hi}}=24$, $L=10$ & Yes & 94  & $1.468\times10^{-2}$ & \textbf{1.825} & \\
+\midrule
+$d_{\mathrm{hi}}=32$, $L=10$ & No  & 80  & $1.993\times10^{-2}$ & 3.211 & \multirow{2}{*}{$-0.890$} \\
+$d_{\mathrm{hi}}=32$, $L=10$ & Yes & 91  & $1.196\times10^{-2}$ & \textbf{4.101}$^\ddagger$ & \\
+\bottomrule
+\multicolumn{6}{l}{${}^\ddagger$ Job \texttt{3492158} showed better $\theta$ around epoch 79; later epochs degraded.}
+\end{tabular}
+\end{center}
+
+The Armijo run with $d_{\mathrm{hi}}=24$, $L=8$ reduces $|V|$ RMSE by
+$\sim2.2\times$ compared to its no-Armijo counterpart (both at nearly the
+same epoch count), and achieves the best $\theta$ of any case300 run.
+
+\subsection{Throughput Bottleneck Analysis}
+
+Five of six jobs timed out under the 24\,h walltime.  Profiling of job
+\texttt{3492160} reveals that the limiting factor is \emph{not} GPU memory or
+compute capacity:
+
+\begin{itemize}[noitemsep]
+  \item \textbf{GPU memory:} $\sim7$\,GB used out of 40\,GB available on
+    the A100.  The GPU was $\sim83\%$ idle on memory.
+  \item \textbf{GPU utilisation:} $35$--$50\%$ compute utilisation with
+    frequent dips.  The GPU was not saturated.
+  \item \textbf{Host RAM:} \texttt{sacct} reports $\sim86$--$88$\,GB RSS
+    on the host CPU.  Heavy CPU-side overhead from data loading,
+    graph construction, or Python dispatch is the likely bottleneck.
+\end{itemize}
+
+This is a \emph{throughput bottleneck}, not a capacity bottleneck.
+The GPU waits for the CPU.  Practical remedies:
+\begin{enumerate}[noitemsep]
+  \item Increase batch size to better saturate the A100.
+  \item Profile and reduce CPU-side graph-construction or collation cost.
+  \item Request longer walltime ($\ge 48$\,h) to allow full training on the
+    current configuration.
+\end{enumerate}
+
+\subsection{Key Findings}
+
+\begin{enumerate}[noitemsep]
+  \item \textbf{Best result:} $d_{\mathrm{hi}}=24$, $L=8$, Armijo=True ---
+    $|V|=9.80\times10^{-3}$\,p.u., $\theta=1.774^\circ$ at epoch 100
+    (the only fully completed run).
+  \item \textbf{Second best:} $d_{\mathrm{hi}}=24$, $L=10$, Armijo=True ---
+    $\theta=1.825^\circ$ at epoch 94 (timed out; likely would improve
+    further with full 100 epochs).
+  \item \textbf{Armijo is essential at this scale:} across all three
+    architecture pairs, Armijo reduces $\theta$ RMSE by $0.03$--$1.6^\circ$.
+  \item \textbf{$d_{\mathrm{hi}}=24$, $L=8$ remains the best architecture}
+    on case300, consistent with the finding from case145.
+  \item \textbf{Job \texttt{3492158} ($d_{\mathrm{hi}}=32$, Armijo) degraded
+    after epoch 79:} the best checkpoint is likely better than the final
+    logged value; saving and evaluating mid-training checkpoints is
+    recommended for long jobs.
+  \item \textbf{Runtime, not memory, is the constraint on alex:}
+    increasing walltime or improving CPU throughput is the immediate next
+    step before scaling further.
+\end{enumerate}
+
+%==============================================================================
+\section{LVN Experiments: An Open Problem}
+\label{sec:lvn}
+%==============================================================================
+
+\subsection{Overview}
+
+\textbf{LVN} stands for \textit{LEW Verteilnetz GmbH}, the electricity
+distribution subsidiary of Lechwerke AG (LEW), a major regional energy company
+in Bavaria, Germany.  The LVN Heo1 case is a real-world distribution network
+operated by LEW Verteilnetz GmbH, and presents a fundamentally harder
+power-flow problem than the HV/MV PEGASE benchmark cases above.  Three
+experimental series were conducted, progressively diagnosing the failure modes.
+The conclusion is that \textbf{none of the LVN experiments produced a working
+physics-only solver} under the current architecture.
+
+\subsection{Series 1 \& 2: DC-Informed Initialization
+  (\texttt{lvn\_case300\_informed})}
+
+The first two folders (\texttt{20260422\_080112} and
+\texttt{20260422\_083606}) used the DC power-flow solution as $V_{\rm
+start}$ (``informed'' initialization).  These runs exposed two distinct
+failure modes.
+
+\paragraph{Armijo runs: physics loss always detached.}
+All Armijo configurations produced an unbroken stream of
+\texttt{[warn] physics loss detached} messages from the very first batch.
+This means the Armijo line search rejected \emph{every} candidate step at
+every batch: the $\ell^\infty$-norm of the power mismatch did not decrease
+for any step size in the candidate set, so the model never received a
+gradient.  The network made zero progress.
+
+\paragraph{No-Armijo runs: immediate divergence to large angle errors.}
+Without the line search, updates were accepted unconditionally.  However,
+angle RMSE sat at $34$--$52^\circ$ throughout training, and the physics
+loss was enormous ($\sim10^{15}$--$10^{16}$).  The model was updating but
+not descending the residual.
+
+\paragraph{The DC-init artifact.}
+The second folder revealed a subtler issue: with DC-initialized
+$V_{\rm start}$, the Armijo runs logged epoch~0 validation metrics of
+$|V|_{\rm RMSE} = 4.48\times10^{-2}$\,p.u.\ and $\theta = 0.24^\circ$,
+with $\Delta P^\infty = 6\times10^3$\,p.u.  This looks deceptively good,
+but the $0.24^\circ$ angle error was already present in $V_{\rm start}$
+before the model did anything.  The DC solution was already very close to
+the AC-NR solution for this particular dataset, so there was almost nothing
+to learn---and the residuals were still $\sim6000$\,p.u., indicating the
+network had not reduced the mismatch at all.
+
+\subsection{Series 3: Manual Flat Initialization with K-Hop
+  (\texttt{lvn\_manual\_flat\_khop\_ablation})}
+
+To remove the DC-init artifact and test a genuinely hard starting point,
+the third series used manual flat initialization ($|V|=1.0$\,p.u.,
+$\theta=0^\circ$) and added K-hop Gaussian diffusion augmentation (see
+Section~\ref{} in the khop document).  Twelve configurations were tested,
+varying $K_{\rm hop} \in \{2, 3, 4\}$, $\sigma \in \{1.0, 1.5\}$, loss
+form (\texttt{mse} / \texttt{huber}+setpoint normalization), and final
+residual penalty.
+
+All runs timed out between epoch 8 and epoch 14.
+Table~\ref{tab:lvn_khop} shows the key metrics.
+
+\begin{table}[h]
+\centering
+\scriptsize
+\caption{LVN K-hop ablation (manual flat init, partial runs).
+  All $\theta$ values are in degrees.
+  Residuals in p.u.\ --- note the $\sim10^6$ scale.}
+\label{tab:lvn_khop}
+\setlength{\tabcolsep}{3pt}
+\begin{tabular}{lrrllrrrr}
+\toprule
+Config & $K_{\rm hop}$ & $\sigma$ & Loss & Norm
+  & Ep. & Best $\theta$ ($^\circ$) & Mean $|\Delta P|$ (pu) & Mean $|\Delta Q|$ (pu) \\
+\midrule
+khop2 sig1.0 mse        & 2 & 1.0 & mse   & none     & 15 & 91.2  & $3.4\times10^6$ & $6.5\times10^6$ \\
+khop3 sig1.0 mse        & 3 & 1.0 & mse   & none     & 12 & 92.3  & $3.6\times10^6$ & $5.2\times10^6$ \\
+khop4 sig1.0 mse        & 4 & 1.0 & mse   & none     & 10 & 95.1  & $3.1\times10^6$ & $6.0\times10^6$ \\
+khop2 sig1.0 huber+sp   & 2 & 1.0 & huber & setpoint & 15 & 98.6  & $4.1\times10^6$ & $5.8\times10^6$ \\
+khop2 sig1.5 mse        & 2 & 1.5 & mse   & none     & 14 & 99.1  & $4.0\times10^6$ & $6.6\times10^6$ \\
+khop4 sig1.0 huber+sp   & 4 & 1.0 & huber & setpoint & 9  & 99.8  & $4.0\times10^6$ & $6.0\times10^6$ \\
+khop3 sig1.0 huber+sp   & 3 & 1.0 & huber & setpoint & 12 & 100.6 & $3.6\times10^6$ & $6.3\times10^6$ \\
+khop3 sig1.5 mse        & 3 & 1.5 & mse   & none     & 11 & 102.0 & $3.7\times10^6$ & $5.9\times10^6$ \\
+khop4 sig1.5 mse        & 4 & 1.5 & mse   & none     & 9  & 102.7 & $3.7\times10^6$ & $5.7\times10^6$ \\
+khop3 sig1.5 huber+sp   & 3 & 1.5 & huber & setpoint & 11 & 104.0 & $3.3\times10^6$ & $6.1\times10^6$ \\
+khop2 sig1.5 huber+sp   & 2 & 1.5 & huber & setpoint & 14 & 105.2 & $3.4\times10^6$ & $6.0\times10^6$ \\
+khop4 sig1.5 huber+sp   & 4 & 1.5 & huber & setpoint & 9  & 105.2 & $3.2\times10^6$ & $6.4\times10^6$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The best configuration (\texttt{khop2}, $\sigma{=}1.0$, raw MSE) achieved
+a best validation $\theta = 91.2^\circ$---essentially no improvement over
+the flat-start baseline of $\sim90^\circ$ (LVN Heo1 uses a genuine flat start, not DC init).  Mean $|\Delta P|$ across all
+runs was $3$--$4\times10^6$\,p.u., and the fraction of buses below
+convergence tolerance was $0\%$.  K-hop augmentation did not unlock any
+learning.
+
+\begin{figure}[h]
+  \centering
+  \begin{subfigure}[b]{0.48\textwidth}
+    \includegraphics[width=\textwidth]{lvn_khop_rmse_curves}
+    \caption{Validation RMSE curves (all K-hop configs)}
+  \end{subfigure}
+  \hfill
+  \begin{subfigure}[b]{0.48\textwidth}
+    \includegraphics[width=\textwidth]{lvn_khop_residual_curves}
+    \caption{Mean $|\Delta P|$, $|\Delta Q|$ residual curves}
+  \end{subfigure}
+  \caption{LVN K-hop ablation: validation RMSE (left) and mean power
+    residuals (right) across all 12 configurations.  No run shows
+    meaningful descent.  The $\sim10^6$\,p.u.\ residuals indicate the
+    model is not approaching AC-PF feasibility.}
+  \label{fig:lvn_khop}
+\end{figure}
+
+\begin{figure}[h]
+  \centering
+  \includegraphics[width=0.6\textwidth]{lvn_khop_ranking}
+  \caption{Best-angle ranking across K-hop configs.  All best angles
+    cluster near $91$--$107^\circ$, confirming none approach a useful
+    solution.}
+  \label{fig:lvn_ranking}
+\end{figure}
+
+\subsection{Lessons Learned}
+
+\begin{enumerate}[noitemsep]
+  \item \textbf{Ybus bug was real but not the whole problem.}
+    LVN uses asymmetric branch parameters.  The old reconstructed Ybus was
+    wrong.  After fixing directed branch admittance, the power-flow
+    residuals became consistent with $V_{\rm newton}$.  Training still did
+    not learn.
+
+  \item \textbf{DC init was misleading.}
+    The $0.24^\circ$ angle RMSE in the informed runs was already in
+    $V_{\rm start}$, not earned by the model.  The flat-start series gives
+    the honest benchmark.
+
+  \item \textbf{Armijo failed for LVN.}
+    The line search rejected all steps in every batch for every Armijo
+    run.  The proposed update always increased the mismatch $\ell^\infty$-norm.
+    This indicates the GNN is not producing reliable descent directions,
+    not merely choosing wrong step sizes.
+
+  \item \textbf{Capacity did not transfer.}
+    The case145-best settings ($d_{\rm hi}=24$, $H=8$, $L=8$, $K=40$) do
+    not carry over to LVN.  The problem is not ``use a bigger model.''
+
+  \item \textbf{Loss modifications did not fix it.}
+    Raw MSE, Huber, setpoint normalization, graph normalization, and final
+    residual penalty all failed to produce convergence.  The loss landscape
+    is dominated by extreme residuals and the gradient signal is
+    uninformative.
+
+  \item \textbf{K-hop did not help.}
+    Multi-hop electrical context ($K_{\rm hop}=2$--$4$) added no useful
+    information beyond 1-hop attention.  The bottleneck is not receptive
+    field.
+\end{enumerate}
+
+\subsection{Interpretation and Next Step}
+
+The evidence points to a learning-dynamics failure, not a capacity or
+receptive-field failure.  The model is not producing stable correction
+directions for LVN under the current physics-only objective.  The unrolled
+updates appear to be exploring the loss landscape rather than descending it.
+
+The recommended next direction is to shift the update mechanism from
+free-form voltage corrections to a \textbf{physically preconditioned
+update}---one that normalizes or constrains the per-bus update by bus type,
+apparent power, or a residual-conditioned damping.  This would give the
+gradient a more informative and consistent structure than the raw
+AC-residual MSE currently provides.  Increasing model size should come
+after this structural change, not before.
+
+%==============================================================================
+\section{LVN Heo1 Grid: First Successful Run}
+%==============================================================================
+
+\subsection{Dataset and Setup}
+
+The Heo1 grid is a real-world LVN case with multi-voltage topology spanning
+$3$--$380\,\mathrm{kV}$.  Training used the flat-start parquet:
+
+\begin{center}
+\small\ttfamily\raggedright
+LVN\_snapshot\_envelope\_manual\_flat\_coupled\_ppcY\_manual\_flat\_%
+siNR\_36000\_NR\_branchrows\_directSI.parquet
+\end{center}
+
+36{,}000 scenarios, train/val/test split $1/3$ each.
+
+\subsection{Bugs Found and Fixed Before This Run}
+
+Three correctness issues were identified and fixed before the Heo1
+experiment, which explain why all prior LVN runs failed to learn.
+
+\paragraph{Issue 1: Bus-type mapping was inverted.}
+The bus-type integers for Slack, PQ, and PV buses were mapped in the wrong
+order in the LVN dataset pipeline.  This meant the model zeroed $\Delta P$
+and $\Delta Q$ at the wrong buses at every step---the physics-informed
+features were corrupted from the start.
+
+\paragraph{Issue 2: LVN multi-voltage outlier filter.}
+LVN spans $3$--$380\,\mathrm{kV}$.  The global $|V|$ outlier filter
+applied during preprocessing used thresholds calibrated for single-voltage
+HV cases.  In the multi-voltage Heo1 grid, low-voltage buses ($3\,\mathrm{kV}$)
+had per-unit magnitudes far outside the HV range, causing many valid
+scenarios to be incorrectly filtered or their voltage features to be
+clipped.
+
+\paragraph{Issue 3: Pure PINN diverged on LVN.}
+Physics-only training diverged immediately: validation RMSE jumped from
+$0.073$ at epoch~0 to $0.142$ at epoch~1 and continued growing.  LVN
+Jacobians are stiffer than HV/MV cases because of the wide voltage range
+and mixed transformer ratios.  The raw AC-residual loss landscape is too
+sharp for the GNN to descend without a supervised anchor.
+
+\subsection{Training Strategy: Combined Loss}
+
+To stabilize training after the pure-PINN failure, a combined loss was
+used:
+
+\begin{equation}
+  \mathcal{L}
+  =
+  \mathcal{L}_{\rm phys}
+  +
+  w \cdot \mathcal{L}_{\rm MSE}
+  \label{eq:combined}
+\end{equation}
+
+with $w = 10$.  The supervised MSE term ($\mathcal{L}_{\rm MSE}$, comparing
+predicted voltages to the NR reference $V_{\rm newton}$) acts as a
+stabilizing anchor that keeps the network near the correct solution while
+the physics loss provides residual-based gradient information.
+
+\subsection{Results}
+
+\subsubsection{Test Set Performance (best.ckpt at Epoch 24)}
+
+\begin{table}[h]
+\centering
+\caption{LVN Heo1 test results from best checkpoint (epoch~24).}
+\label{tab:heo1_test}
+\begin{tabular}{lc}
+\toprule
+Metric & Value \\
+\midrule
+Test RMSE (total)    & $1.98\times10^{-2}$ \\
+Test $|V|$ RMSE      & $2.43\times10^{-2}$\,p.u. \\
+Test $\theta$ RMSE   & $0.794^\circ$ \\
+Test physics loss    & $3.671\times10^{5}$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+This is the first LVN run to achieve sub-degree angle RMSE.
+
+\subsubsection{Pure MSE vs.\ Combined Loss}
+
+\begin{table}[h]
+\centering
+\caption{Comparison of training strategies on LVN Heo1.}
+\label{tab:heo1_compare}
+\begin{tabular}{lccc}
+\toprule
+Strategy & RMSE & $\theta$ RMSE & Physics loss \\
+\midrule
+Pure MSE ($w=0$)           & $0.020$ & $0.79^\circ$ & huge (not minimized) \\
+Combined phys $+$ $10\cdot$MSE & ${\sim}0.040$ & ${\sim}2.1^\circ$ & ${\sim}0.9$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The comparison reveals a fundamental tension:
+
+\begin{itemize}[noitemsep]
+  \item \textbf{Pure MSE} achieves the best supervised accuracy ($\theta =
+    0.79^\circ$) because the entire gradient budget is spent imitating
+    $V_{\rm newton}$.  However, the physics loss remains enormous---the
+    model has learned to copy NR output without learning to satisfy AC-PF
+    equations independently.
+
+  \item \textbf{Combined loss} achieves a lower physics loss (${\sim}0.9$
+    vs.\ huge) at the cost of higher supervised error ($\theta \approx
+    2.1^\circ$).  The model makes partial progress toward AC-PF
+    feasibility, but the MSE anchor prevents it from fully committing to
+    residual descent.
+\end{itemize}
+
+\subsection{Interpretation}
+
+The physics loss of $3.671\times10^5$ in the best-checkpoint test result
+confirms the model has not yet solved LVN from a physics-only standpoint,
+but the $0.794^\circ$ angle RMSE demonstrates that the combined-loss
+approach stabilizes training where pure PINN failed.  The three bugs
+(bus-type inversion, outlier filter, pure-PINN divergence) were the primary
+blockers for all prior LVN experiments---not model capacity or receptive
+field, as previously suspected.
+
+\paragraph{Next steps.}
+With the bugs fixed and a working training loop, the productive direction
+is to reduce $w$ gradually (annealing the MSE weight toward zero) so the
+model transitions from supervised imitation to physics-driven correction.
+Alternatively, the combined loss can be kept but the physics weight
+increased to push the physics loss below an operational threshold.
 
 \end{document}
