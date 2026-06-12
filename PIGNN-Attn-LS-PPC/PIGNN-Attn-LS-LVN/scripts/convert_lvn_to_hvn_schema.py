@@ -77,6 +77,7 @@ def convert_row(row: pd.Series) -> dict:
     u_start = np.asarray(row.u_start, dtype=np.complex128)
     u_newton = np.asarray(row.u_newton, dtype=np.complex128)
     S_start = np.asarray(row.S_start, dtype=np.complex128)
+    S_newton = np.asarray(row['S_newton'], dtype=np.complex128)
     S_base = float(row.S_base)
 
     # --- Per-unit normalisation ---
@@ -91,7 +92,8 @@ def convert_row(row: pd.Series) -> dict:
     s_scale = S_base / TARGET_S_BASE  # e.g. 1e6 / 1e8 = 0.01 for LVN
     u_start_pu = (u_start / V_base).astype(np.complex64)
     u_newton_pu = (u_newton / V_base).astype(np.complex64)
-    S_start_pu = (S_start / TARGET_S_BASE).astype(np.complex64)
+    S_start_pu  = (S_start  / TARGET_S_BASE).astype(np.complex64)
+    S_newton_pu = (S_newton / TARGET_S_BASE).astype(np.complex64)
     Y_series_pu = (Y_series * s_scale).astype(np.complex64)
     Y_shunt_pu = (Y_shunt * s_scale).astype(np.float64)  # PU susceptance (treated as imaginary in encoder)
 
@@ -149,8 +151,8 @@ def convert_row(row: pd.Series) -> dict:
         'active_Y_shunt': npy_bytes(Y_c_sum),
         'u_start': npy_bytes(u_start_pu),
         'u_newton': npy_bytes(u_newton_pu),
-        'S_start': npy_bytes(S_start_pu),
-        'S_newton': npy_bytes(np.zeros_like(S_start_pu)),
+        'S_start':  npy_bytes(S_start_pu),
+        'S_newton': npy_bytes(S_newton_pu),   # real NR solution power (rebased to 100 MVA)
         'I_newton': npy_bytes(np.zeros_like(S_start_pu)),
         'vn_log': npy_bytes(vn_log),
     }
@@ -174,7 +176,7 @@ def main():
     print(f'Loading {in_path} ...', flush=True)
     cols = ['bus_number', 'branch_number', 'gridtype', 'U_base', 'S_base',
             'vn_kv', 'bus_typ', 'Branch_f_bus', 'Branch_t_bus', 'Branch_status',
-            'Y_Lines', 'Y_C_Lines', 'u_start', 'u_newton', 'S_start']
+            'Y_Lines', 'Y_C_Lines', 'u_start', 'u_newton', 'S_start', 'S_newton']
     df_full = pd.read_parquet(in_path, columns=cols)
     if args.limit is not None:
         df_full = df_full.iloc[:args.limit].reset_index(drop=True)
@@ -183,7 +185,7 @@ def main():
 
     bcols = ['vn_kv', 'bus_typ', 'Branch_f_bus', 'Branch_t_bus',
              'Branch_status', 'Y_Lines', 'Y_C_Lines',
-             'u_start', 'u_newton', 'S_start']
+             'u_start', 'u_newton', 'S_start', 'S_newton']
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     # STREAMING output: ParquetWriter holds at most one row group in memory.

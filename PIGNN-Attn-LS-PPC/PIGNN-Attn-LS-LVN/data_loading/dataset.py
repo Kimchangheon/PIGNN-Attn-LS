@@ -1,3 +1,4 @@
+from __future__ import annotations
 import ast, functools, json
 import hashlib
 import logging
@@ -119,7 +120,7 @@ class ChanghunDataset(Dataset):
         path: Union[str, Path, Sequence[Union[str, Path]]],
         *,
         per_unit: bool = False,
-        device: str | torch.device | None = None,
+        device: "Optional[Union[str, torch.device]]" = None,
         use_cache: bool = True,
         cache_dir: str | Path = "./.cache/datasets",
         rebuild_cache: bool = False,

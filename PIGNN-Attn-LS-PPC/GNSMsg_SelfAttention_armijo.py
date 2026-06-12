@@ -277,6 +277,7 @@ class GNSMsg_EdgeSelfAttn(nn.Module):
         armijo_c1: float = 1e-4,
         armijo_max_backtracks: int = 5,
         armijo_min_alpha: float = 0.0625,
+        bus_feat_extra_dim: int = 0,
         dtheta_max: float = 0.30,
         dvm_frac: float = 0.10,
         physics_loss_form: str = "mse",
@@ -311,7 +312,8 @@ class GNSMsg_EdgeSelfAttn(nn.Module):
         assert self.d_model % self.n_heads == 0
         self.num_attn_layers = num_attn_layers
 
-        self.bus_feat_dim = 4 + d
+        self.bus_feat_extra_dim = int(bus_feat_extra_dim)
+        self.bus_feat_dim = 4 + self.bus_feat_extra_dim + d
         self.edge_feat_dim = 9   # <-- now includes tau + theta + is_trafo
 
         self.in_proj = nn.Linear(self.bus_feat_dim, self.d_model)
@@ -330,10 +332,22 @@ class GNSMsg_EdgeSelfAttn(nn.Module):
         self.v_head     = nn.ModuleList([nn.Linear(self.d_model, 1) for _ in range(K)])
         self.m_head     = nn.ModuleList([nn.Linear(self.d_model, d) for _ in range(K)])
 
+        # Output heads: zero-init so the model starts with identity corrections
+        # (Vpred = V_start at epoch 0), matching original behaviour.
         for k in range(K):
             nn.init.zeros_(self.theta_head[k].weight); nn.init.zeros_(self.theta_head[k].bias)
             nn.init.zeros_(self.v_head[k].weight);     nn.init.zeros_(self.v_head[k].bias)
             nn.init.zeros_(self.m_head[k].weight);     nn.init.zeros_(self.m_head[k].bias)
+
+        # Feature extraction layers (in_proj + attention blocks): sd=0.02 normal
+        # init, matching the student's weight_init="sd0.02" recipe. This gives
+        # the attention layers a meaningful starting point so gradient flow is
+        # better conditioned from the first update.
+        for module in [self.in_proj] + list(self.blocks.modules()):
+            if isinstance(module, nn.Linear):
+                nn.init.normal_(module.weight, mean=0.0, std=0.02)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
 
     def _graph_scale_from_s(self, S_abs, n_nodes_per_graph):
         if n_nodes_per_graph is None:
@@ -409,6 +423,7 @@ class GNSMsg_EdgeSelfAttn(nn.Module):
         V0,
         n_nodes_per_graph=None,
         Y_shunt_bus=None,
+        vn_log=None,
     ):
         """
         Works for:
@@ -515,6 +530,12 @@ class GNSMsg_EdgeSelfAttn(nn.Module):
             DQ = (Q_set - Sc.imag).masked_fill(slack_mask | pv_mask, 0.0)
 
             bus_feat = torch.stack([v, th, DP, DQ], dim=-1)
+            if self.bus_feat_extra_dim > 0:
+                if vn_log is None:
+                    extra = bus_feat.new_zeros(bus_feat.shape[:-1] + (self.bus_feat_extra_dim,))
+                else:
+                    extra = vn_log.unsqueeze(-1)
+                bus_feat = torch.cat([bus_feat, extra], dim=-1)
             x = self.in_proj(torch.cat([bus_feat, m], dim=-1))
 
             # sparse attention message passing
@@ -565,7 +586,7 @@ class GNSMsg_EdgeSelfAttn(nn.Module):
                         alphas = alphas[alphas >= min_alpha]
                     if alphas.numel() == 0:
                         alphas = v.new_tensor([min_alpha])
-                elif self.armijo_mode == "geometric":
+                elif self.armijo_mode in ("geometric", "geometric_safe", "reject"):
                     alphas = []
                     a_tmp = 1.0
                     for _ in range(max_backtracks):
@@ -575,33 +596,62 @@ class GNSMsg_EdgeSelfAttn(nn.Module):
                             break
                     alphas = v.new_tensor(alphas)
                 else:
-                    raise ValueError(f"Unknown armijo_mode={self.armijo_mode!r}; expected 'fixed' or 'geometric'.")
+                    raise ValueError(f"Unknown armijo_mode={self.armijo_mode!r}; expected 'fixed', 'geometric', 'geometric_safe', or 'reject'.")
 
-                accepted = False
-                for a_tensor in alphas:
-                    a = float(a_tensor)
+                def armijo_candidate(a):
                     v_try = torch.clamp(v + a * dv, v_min, v_max)
                     th_try = (th + a * dth + math.pi) % (2 * math.pi) - math.pi
-
                     with torch.no_grad():
                         F_try = _batched_mismatch_inf_norm(Y, v_try, th_try, P_set, Q_set, slack_mask, pv_mask)
                         ok = bool(F_try <= (1.0 - c1 * a) * F0)
+                    return v_try, th_try, ok
 
+                if self.armijo_mode == "fixed":
+                    accepted = False
+                    for a_tensor in alphas:
+                        a = float(a_tensor)
+                        v_try, th_try, ok = armijo_candidate(a)
+                        if ok:
+                            v = v_try
+                            th = th_try
+                            m = m + a * dm
+                            accepted = True
+                            break
+
+                    if not accepted:
+                        a = float(alphas[-1])
+                        v2 = torch.clamp(v + a * dv, v_min, v_max)
+                        th2 = (th + a * dth + math.pi) % (2 * math.pi) - math.pi
+                        with torch.no_grad():
+                            ok = _batched_mismatch_inf_norm(Y, v2, th2, P_set, Q_set, slack_mask, pv_mask) < F0
+                        if ok:
+                            v, th, m = v2, th2, m + a * dm
+                    continue
+
+                accepted = False
+                a_sel = float(alphas[-1])
+                for a_tensor in alphas:
+                    a = float(a_tensor)
+                    _, _, ok = armijo_candidate(a)
                     if ok:
-                        v = v_try
-                        th = th_try
-                        m = m + a * dm
                         accepted = True
+                        a_sel = a
                         break
 
-                if not accepted and self.armijo_mode == "fixed":
-                    a = float(alphas[-1])
-                    v2 = torch.clamp(v + a * dv, v_min, v_max)
-                    th2 = (th + a * dth + math.pi) % (2 * math.pi) - math.pi
-                    with torch.no_grad():
-                        ok = _batched_mismatch_inf_norm(Y, v2, th2, P_set, Q_set, slack_mask, pv_mask) < F0
-                    if ok:
-                        v, th, m = v2, th2, m + a * dm
+                if self.armijo_mode == "geometric_safe" and not accepted:
+                    a_sel = min_alpha
+
+                if self.armijo_mode == "reject" and not accepted:
+                    continue
+
+                # For geometric, match the LVN/student Armijo semantics: the
+                # line search only selects a scalar step size. In geometric_safe,
+                # rejected searches use a tiny configured fallback to keep
+                # gradients alive while staying near old PPC. In reject mode,
+                # rejected searches discard the update entirely.
+                v = torch.clamp(v + a_sel * dv, v_min, v_max)
+                th = (th + a_sel * dth + math.pi) % (2 * math.pi) - math.pi
+                m = m + a_sel * dm
             else:
                 th = (th + dth + math.pi) % (2 * math.pi) - math.pi
                 v = torch.clamp(v + dv, 0.75, 1.20)

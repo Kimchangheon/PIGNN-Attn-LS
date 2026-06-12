@@ -364,7 +364,7 @@ class GNSMsg_EdgeSelfAttnKHop(nn.Module):
                         alphas = alphas[alphas >= min_alpha]
                     if alphas.numel() == 0:
                         alphas = v.new_tensor([min_alpha])
-                elif self.armijo_mode == "geometric":
+                elif self.armijo_mode in ("geometric", "geometric_safe", "reject"):
                     alphas = []
                     a_tmp = 1.0
                     for _ in range(max_backtracks):
@@ -374,31 +374,62 @@ class GNSMsg_EdgeSelfAttnKHop(nn.Module):
                             break
                     alphas = v.new_tensor(alphas)
                 else:
-                    raise ValueError(f"Unknown armijo_mode={self.armijo_mode!r}; expected 'fixed' or 'geometric'.")
+                    raise ValueError(f"Unknown armijo_mode={self.armijo_mode!r}; expected 'fixed', 'geometric', 'geometric_safe', or 'reject'.")
 
-                accepted = False
-                for a_tensor in alphas:
-                    a = float(a_tensor)
+                def armijo_candidate(a):
                     v_try = torch.clamp(v + a * dv, v_min, v_max)
                     th_try = (th + a * dth + math.pi) % (2 * math.pi) - math.pi
                     with torch.no_grad():
                         F_try = _batched_mismatch_inf_norm(Y, v_try, th_try, P_set, Q_set, slack_mask, pv_mask)
                         ok = bool(F_try <= (1.0 - c1 * a) * F0)
+                    return v_try, th_try, ok
+
+                if self.armijo_mode == "fixed":
+                    accepted = False
+                    for a_tensor in alphas:
+                        a = float(a_tensor)
+                        v_try, th_try, ok = armijo_candidate(a)
+                        if ok:
+                            v = v_try
+                            th = th_try
+                            m = m + a * dm
+                            accepted = True
+                            break
+
+                    if not accepted:
+                        a = float(alphas[-1])
+                        v2 = torch.clamp(v + a * dv, v_min, v_max)
+                        th2 = (th + a * dth + math.pi) % (2 * math.pi) - math.pi
+                        with torch.no_grad():
+                            ok = _batched_mismatch_inf_norm(Y, v2, th2, P_set, Q_set, slack_mask, pv_mask) < F0
+                        if ok:
+                            v, th, m = v2, th2, m + a * dm
+                    continue
+
+                accepted = False
+                a_sel = float(alphas[-1])
+                for a_tensor in alphas:
+                    a = float(a_tensor)
+                    _, _, ok = armijo_candidate(a)
                     if ok:
-                        v = v_try
-                        th = th_try
-                        m = m + a * dm
                         accepted = True
+                        a_sel = a
                         break
 
-                if not accepted and self.armijo_mode == "fixed":
-                    a = float(alphas[-1])
-                    v2 = torch.clamp(v + a * dv, v_min, v_max)
-                    th2 = (th + a * dth + math.pi) % (2 * math.pi) - math.pi
-                    with torch.no_grad():
-                        ok = _batched_mismatch_inf_norm(Y, v2, th2, P_set, Q_set, slack_mask, pv_mask) < F0
-                    if ok:
-                        v, th, m = v2, th2, m + a * dm
+                if self.armijo_mode == "geometric_safe" and not accepted:
+                    a_sel = min_alpha
+
+                if self.armijo_mode == "reject" and not accepted:
+                    continue
+
+                # For geometric, match the LVN/student Armijo semantics: the
+                # line search only selects a scalar step size. In geometric_safe,
+                # rejected searches use a tiny configured fallback to keep
+                # gradients alive while staying near old PPC. In reject mode,
+                # rejected searches discard the update entirely.
+                v = torch.clamp(v + a_sel * dv, v_min, v_max)
+                th = (th + a_sel * dth + math.pi) % (2 * math.pi) - math.pi
+                m = m + a_sel * dm
             else:
                 th = (th + dth + math.pi) % (2 * math.pi) - math.pi
                 v = torch.clamp(v + dv, 0.75, 1.20)

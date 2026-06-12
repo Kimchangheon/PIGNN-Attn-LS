@@ -97,44 +97,64 @@ def _case_label_from_source(preset: str, cgmes_path: str, case_name: str) -> str
 
 SCENARIO_PRESETS = {
     "easy": dict(
+        load_scale_range=(0.90, 1.10),   # ±10% global — proportionate to 2% per-bus noise
+        scale_gen_with_load=True,
         jitter_load=0.02,
+        jitter_load_q=0.03,
         jitter_gen=0.01,
-        pv_vset_range=(0.995, 1.005),
+        pv_vset_range=(0.998, 1.002),    # ±0.2%, very tight for easy scenario
         rand_u_start=False,
         angle_jitter_deg=0.5,
         mag_jitter_pq=0.002,
+        line_outage_prob=0.0,
     ),
     "no_change": dict(
+        load_scale_range=None,
+        scale_gen_with_load=True,
         jitter_load=0.0,
+        jitter_load_q=0.0,
         jitter_gen=0.0,
         pv_vset_range=(1.0, 1.0),
         rand_u_start=False,
         angle_jitter_deg=0.0,
         mag_jitter_pq=0.0,
+        line_outage_prob=0.0,
     ),
     "A": dict(
+        load_scale_range=(0.70, 1.30),   # ±30% — typical day/night load swing
+        scale_gen_with_load=True,
         jitter_load=0.05,
+        jitter_load_q=0.08,
         jitter_gen=0.03,
-        pv_vset_range=(0.99, 1.02),
+        pv_vset_range=(0.97, 1.03),      # symmetric ±3% around 1.0
         rand_u_start=True,
         angle_jitter_deg=3.0,
         mag_jitter_pq=0.01,
+        line_outage_prob=0.0,
     ),
     "B": dict(
+        load_scale_range=(0.60, 1.40),   # ±40% — seasonal load variation
+        scale_gen_with_load=True,
         jitter_load=0.10,
+        jitter_load_q=0.15,
         jitter_gen=0.05,
-        pv_vset_range=(0.98, 1.03),
+        pv_vset_range=(0.95, 1.05),      # symmetric ±5% — practical operating range
         rand_u_start=True,
         angle_jitter_deg=5.0,
         mag_jitter_pq=0.02,
+        line_outage_prob=0.01,
     ),
     "C": dict(
+        load_scale_range=(0.50, 1.50),   # ±50% — stress testing, near-collapse coverage
+        scale_gen_with_load=True,
         jitter_load=0.15,
+        jitter_load_q=0.15,              # capped at 0.15 — 22% was unrealistically high
         jitter_gen=0.08,
-        pv_vset_range=(0.97, 1.04),
+        pv_vset_range=(0.93, 1.07),      # symmetric ±7% — pushed but still physical
         rand_u_start=True,
         angle_jitter_deg=7.0,
         mag_jitter_pq=0.03,
+        line_outage_prob=0.02,
     ),
 }
 
@@ -251,6 +271,10 @@ class ParquetAppendWriter:
             pa.field("u_newton", pa.binary()),
             pa.field("S_start", pa.binary()),
             pa.field("S_newton", pa.binary()),
+            # NR diagnostics — always present so the reader never has to handle missing columns
+            pa.field("converged", pa.int8()),        # 1 = converged, 0 = did not converge
+            pa.field("final_misinf", pa.float64()),  # inf-norm mismatch at last iteration (NaN if not diagnosed)
+            pa.field("nr_iterations", pa.int32()),   # number of NR iterations executed
         ])
 
         self._schema = pa.schema(fields)
@@ -368,6 +392,7 @@ def _generate_one_record_serialized() -> Dict[str, Any]:
         cgmes_model_a_cleanup=bool(_CFG.get("cgmes_model_a_cleanup", False)),
         seed=sample_seed,
         jitter_load=float(_CFG["jitter_load"]),
+        jitter_load_q=float(_CFG["jitter_load_q"]),
         jitter_gen=float(_CFG["jitter_gen"]),
         pv_vset_range=_CFG["pv_vset_range"],
         rand_u_start=bool(_CFG["rand_u_start"]),
@@ -377,6 +402,9 @@ def _generate_one_record_serialized() -> Dict[str, Any]:
         trafo_i0_percent=_CFG["trafo_i0_percent"],
         force_branch_shunt_pu=force_branch_shunt_pu,
         start_mode=start_mode,
+        load_scale_range=_CFG["load_scale_range"],
+        scale_gen_with_load=bool(_CFG["scale_gen_with_load"]),
+        line_outage_prob=float(_CFG["line_outage_prob"]),
     )
 
     if ybus_mode.lower() == "stamped":
@@ -400,6 +428,11 @@ def _generate_one_record_serialized() -> Dict[str, Any]:
     branch_number = int(len(Branch_f_bus))
 
     ymat_bytes = ndarray_to_npy_bytes(np.asarray(Y_matrix, dtype=np.complex128).copy()) if save_y_matrix else None
+
+    # NR diagnostic defaults (overwritten below if NR is actually run)
+    nr_converged = 0
+    nr_final_misinf = float("nan")
+    nr_iterations = 0
 
     if not is_connected:
         u_newton_si = np.zeros_like(u_start, dtype=np.complex128)
@@ -436,7 +469,11 @@ def _generate_one_record_serialized() -> Dict[str, Any]:
             mismatch_tol=float(_CFG["mismatch_tol"]),
         )
 
-        u_newton_raw, _I_unused, S_newton_raw, _nr_diag = nr_out
+        u_newton_raw, _I_unused, S_newton_raw, nr_diag = nr_out
+
+        nr_converged    = 1 if bool(nr_diag.get("converged", False)) else 0
+        nr_final_misinf = float(nr_diag["final_misinf"]) if nr_diag.get("final_misinf") is not None else float("nan")
+        nr_iterations   = int(nr_diag.get("iterations", 0))
 
         if pu_nr:
             u_newton_arr = np.asarray(u_newton_raw)
@@ -487,6 +524,9 @@ def _generate_one_record_serialized() -> Dict[str, Any]:
         "u_newton": ndarray_to_npy_bytes(np.asarray(u_newton_si, dtype=np.complex128)),
         "S_start": ndarray_to_npy_bytes(np.asarray(s_multi, dtype=np.complex128)),
         "S_newton": ndarray_to_npy_bytes(np.asarray(S_newton_si, dtype=np.complex128)),
+        "converged":     nr_converged,
+        "final_misinf":  nr_final_misinf,
+        "nr_iterations": nr_iterations,
     }
 
     if save_y_matrix:
@@ -496,12 +536,16 @@ def _generate_one_record_serialized() -> Dict[str, Any]:
 
 
 def _generate_batch(n_rows: int) -> List[Dict[str, Any]]:
+    drop_nc = bool(_CFG.get("drop_nonconverged", False))
     out: List[Dict[str, Any]] = []
     err_shown = 0
 
     for _ in range(n_rows):
         try:
-            out.append(_generate_one_record_serialized())
+            rec = _generate_one_record_serialized()
+            if drop_nc and rec["converged"] == 0:
+                continue
+            out.append(rec)
         except Exception as e:
             if DBG and err_shown < 3:
                 print("[WORKER ERROR]", repr(e))
@@ -582,6 +626,42 @@ def parse_args():
         help="Use pandapower ppcY directly or rebuild Y_matrix by stamping PPC.",
     )
 
+    parser.add_argument(
+        "--jitter_load_q",
+        type=float,
+        default=None,
+        help=(
+            "Std-dev of the Gaussian multiplier applied independently to each load's q_mvar. "
+            "If not set, falls back to the scenario preset value. "
+            "Use this to override the preset's Q jitter without changing other knobs."
+        ),
+    )
+    parser.add_argument(
+        "--load_scale_lo",
+        type=float,
+        default=None,
+        help="Lower bound of the uniform global load-scale factor (e.g. 0.7). "
+             "Overrides the preset's load_scale_range lower bound.",
+    )
+    parser.add_argument(
+        "--load_scale_hi",
+        type=float,
+        default=None,
+        help="Upper bound of the uniform global load-scale factor (e.g. 1.3). "
+             "Overrides the preset's load_scale_range upper bound.",
+    )
+    parser.add_argument(
+        "--line_outage_prob",
+        type=float,
+        default=None,
+        help="Per-line probability of N-1 outage. Overrides the preset value.",
+    )
+    parser.add_argument(
+        "--drop_nonconverged",
+        action="store_true",
+        help="Skip (do not write) rows where NR did not converge. "
+             "The total row count in the output file may be less than --runs.",
+    )
     parser.add_argument("--K", type=int, default=40, help="Newton-Raphson max iterations")
     parser.add_argument("--runs", type=int, default=10000, help="Total samples")
     parser.add_argument("--save_steps", type=int, default=2000, help="Rows per Parquet append")
@@ -695,7 +775,32 @@ def main():
         save_y_matrix=save_y_matrix,
 
         jitter_load=float(scenario_cfg["jitter_load"]),
+        jitter_load_q=float(
+            args.jitter_load_q
+            if args.jitter_load_q is not None
+            else scenario_cfg["jitter_load_q"]
+        ),
         jitter_gen=float(scenario_cfg["jitter_gen"]),
+        # Global load scale: CLI overrides take priority over preset
+        load_scale_range=(
+            None
+            if (scenario_cfg["load_scale_range"] is None
+                and args.load_scale_lo is None
+                and args.load_scale_hi is None)
+            else (
+                float(args.load_scale_lo if args.load_scale_lo is not None
+                      else scenario_cfg["load_scale_range"][0]),
+                float(args.load_scale_hi if args.load_scale_hi is not None
+                      else scenario_cfg["load_scale_range"][1]),
+            )
+        ),
+        scale_gen_with_load=bool(scenario_cfg["scale_gen_with_load"]),
+        line_outage_prob=float(
+            args.line_outage_prob
+            if args.line_outage_prob is not None
+            else scenario_cfg["line_outage_prob"]
+        ),
+        drop_nonconverged=bool(args.drop_nonconverged),
         pv_vset_range=scenario_cfg["pv_vset_range"],
         rand_u_start=bool(scenario_cfg["rand_u_start"]),
         angle_jitter_deg=float(scenario_cfg["angle_jitter_deg"]),
@@ -749,6 +854,11 @@ def main():
     print(f"  ybus_mode                 = {args.ybus_mode}")
     print(f"  scenario_level            = {args.scenario_level}")
     print(f"  scenario_cfg              = {scenario_cfg}")
+    print(f"  jitter_load_q (effective) = {cfg['jitter_load_q']}")
+    print(f"  load_scale_range          = {cfg['load_scale_range']}")
+    print(f"  scale_gen_with_load       = {cfg['scale_gen_with_load']}")
+    print(f"  line_outage_prob          = {cfg['line_outage_prob']}")
+    print(f"  drop_nonconverged         = {cfg['drop_nonconverged']}")
     print(f"  K                         = {args.K}")
     print(f"  pu_nr                     = {args.pu_nr}")
     print(f"  start_mode                = {args.start_mode}")

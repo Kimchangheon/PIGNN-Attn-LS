@@ -1,3 +1,4 @@
+from __future__ import annotations
 # ---------------------------------------------------------------
 # 2.  Helper that builds one DataLoader whose batches are homogeneous
 # ---------------------------------------------------------------

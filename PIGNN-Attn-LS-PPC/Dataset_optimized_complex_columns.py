@@ -50,6 +50,7 @@ def reconstruct_Y_pandapower_branchrows_direct_SI_np(
     Branch_y_shunt_to: np.ndarray,
     Y_shunt_bus: np.ndarray,
     Vbase_bus: Optional[np.ndarray] = None,
+    out_dtype=COMPLEX_DTYPE,
 ) -> np.ndarray:
     """
     Reconstruct dense Ybus in SI from one metadata row per PPC branch row.
@@ -93,41 +94,41 @@ def reconstruct_Y_pandapower_branchrows_direct_SI_np(
         Y[f, t] += Yft
         Y[t, f] += Ytf
 
-    return Y.astype(COMPLEX_DTYPE, copy=False)
+    return Y.astype(out_dtype, copy=False)
 
 
-def ybus_si_to_pu(Y_si: np.ndarray, Vbase_bus: np.ndarray, S_base: float) -> np.ndarray:
+def ybus_si_to_pu(Y_si: np.ndarray, Vbase_bus: np.ndarray, S_base: float, out_dtype=COMPLEX_DTYPE) -> np.ndarray:
     """
     Entrywise Ybus SI -> pu with local bus bases:
         Y_pu[i,j] = Y_SI[i,j] * V_i * V_j / S_base
     """
     scale = np.outer(Vbase_bus, Vbase_bus) / float(S_base)
-    return (Y_si * scale).astype(COMPLEX_DTYPE, copy=False)
+    return (Y_si * scale).astype(out_dtype, copy=False)
 
 
-def ysh_bus_si_to_pu(Ysh_si: np.ndarray, Vbase_bus: np.ndarray, S_base: float) -> np.ndarray:
+def ysh_bus_si_to_pu(Ysh_si: np.ndarray, Vbase_bus: np.ndarray, S_base: float, out_dtype=COMPLEX_DTYPE) -> np.ndarray:
     """
     Bus shunt SI -> pu:
         Ysh_pu[i] = Ysh_SI[i] * V_i^2 / S_base
     """
     scale = (Vbase_bus ** 2) / float(S_base)
-    return (Ysh_si * scale).astype(COMPLEX_DTYPE, copy=False)
+    return (Ysh_si * scale).astype(out_dtype, copy=False)
 
 
-def u_si_to_pu_per_bus(u_si: np.ndarray, Vbase_bus: np.ndarray) -> np.ndarray:
+def u_si_to_pu_per_bus(u_si: np.ndarray, Vbase_bus: np.ndarray, out_dtype=COMPLEX_DTYPE) -> np.ndarray:
     """
     Voltage SI -> pu per bus:
         U_pu[i] = U_SI[i] / V_i
     """
-    return (u_si / Vbase_bus).astype(COMPLEX_DTYPE, copy=False)
+    return (u_si / Vbase_bus).astype(out_dtype, copy=False)
 
 
-def s_si_to_pu(S_si: np.ndarray, S_base: float) -> np.ndarray:
+def s_si_to_pu(S_si: np.ndarray, S_base: float, out_dtype=COMPLEX_DTYPE) -> np.ndarray:
     """
     Power SI -> pu:
         S_pu[i] = S_SI[i] / S_base
     """
-    return (S_si / float(S_base)).astype(COMPLEX_DTYPE, copy=False)
+    return (S_si / float(S_base)).astype(out_dtype, copy=False)
 
 
 # --------------------------------------------------------------------------- #
@@ -169,6 +170,16 @@ class ChanghunDataset(Dataset):
         "_row_group_ends",
         "_row_group_cache",
         "_num_rows",
+        "_target_S_base",
+        "_share_ybus",
+        "_shared_ybus_tensor",
+        "_share_grid",
+        "_shared_grid_tensors",
+        "_shared_grid_numpy",
+        "_complex_np_dtype",
+        "_complex_torch_dtype",
+        "_real_np_dtype",
+        "_real_torch_dtype",
     )
 
     def __init__(
@@ -180,6 +191,10 @@ class ChanghunDataset(Dataset):
         no_cache_dense_ybus: bool = False,
         lazy_row_groups: bool = False,
         row_group_cache_size: int = 2,
+        target_S_base: Optional[float] = None,
+        share_ybus: bool = False,
+        share_grid: bool = False,
+        complex_dtype: str = "complex64",
     ):
         self._per_unit = bool(per_unit)
         self._device = torch.device(device) if device is not None else None
@@ -191,6 +206,67 @@ class ChanghunDataset(Dataset):
         self._row_group_ends = []
         self._row_group_cache = OrderedDict()
         self._num_rows = 0
+        complex_dtype = str(complex_dtype).lower()
+        if complex_dtype in ("complex128", "complex_double", "cdouble", "128"):
+            self._complex_np_dtype = np.complex128
+            self._complex_torch_dtype = torch.complex128
+            self._real_np_dtype = np.float64
+            self._real_torch_dtype = torch.float64
+        elif complex_dtype in ("complex64", "complex_float", "cfloat", "64"):
+            self._complex_np_dtype = np.complex64
+            self._complex_torch_dtype = torch.complex64
+            self._real_np_dtype = np.float32
+            self._real_torch_dtype = torch.float32
+        else:
+            raise ValueError(
+                f"Unsupported complex_dtype={complex_dtype!r}; use 'complex64' or 'complex128'."
+            )
+        # Optional in-memory rebase of S_base for per-unit conversion.
+        # Default (None) keeps the parquet's S_base as-is. Pass an explicit
+        # value (e.g. target_S_base=100e6) to normalize the per-unit scale
+        # across datasets. Useful for distribution-network parquets shipped
+        # with S_base=1 MVA (e.g. LVN Heo1, pandapower default) whose per-unit
+        # S_pu / Y_pu are ~100x larger than IEEE/PEGASE benchmarks, causing
+        # Armijo to reject every step and pure-PINN to diverge. Mathematically
+        # equivalent to a base change (V_pu unchanged; Y_pu and S_pu both
+        # scale by S_raw / S_target); the power-flow equation is preserved.
+        # Recommended long-term fix: rebase the parquet file itself.
+        self._target_S_base = (
+            float(target_S_base) if target_S_base is not None else None
+        )
+        # share_ybus: when True, assume every row in the dataset shares the
+        # SAME admittance matrix (e.g. a single grid sampled under different
+        # load/generation perturbations -- which is exactly how the LVN /
+        # case300 perturbation datasets are generated). The Ybus is then
+        # computed from row 0 once, stored as self._shared_ybus_tensor, and
+        # re-used for every __getitem__ -- skipping per-row dense Y
+        # reconstruction (~722^2 complex = 4MB allocation + Python branch
+        # loop) and the parquet read of Branch_y_* / Y_shunt_bus / Y_matrix
+        # columns. For LVN 36k this removes the single biggest source of
+        # lazy-mode disk thrashing.
+        self._share_ybus = bool(share_ybus)
+        self._shared_ybus_tensor: Optional[torch.Tensor] = None
+        # share_grid: when True, all grid-only tensors (topology, branch
+        # admittances, vn_kv, bus_type, Y_shunt_bus, Y_Lines, Y_C_Lines,
+        # transformer flags) are built once from row 0 and re-used for every
+        # __getitem__. Implies share_ybus=True. Only per-row-varying tensors
+        # (u_newton, S_start, S_newton, U_newton, V_newton) are rebuilt per
+        # call. Safe for the same assumption as share_ybus: every row
+        # describes the SAME grid sampled under different perturbations.
+        # NOTE: u_start is included in the shared set only when it is also
+        # constant across rows (e.g. flat-start parquets). DC-informed
+        # parquets have row-dependent u_start so share_grid will detect the
+        # mismatch on the first comparison and fall back to per-row build
+        # for that field.
+        self._share_grid = bool(share_grid)
+        # Field-name -> torch.Tensor for direct row dict insertion.
+        self._shared_grid_tensors: Dict[str, torch.Tensor] = {}
+        # Small numpy arrays needed during per-row per-unit math
+        # (Vbase_bus for u_* division). Populated alongside grid tensors.
+        self._shared_grid_numpy: Dict[str, np.ndarray] = {}
+        if self._share_grid:
+            # share_grid implies share_ybus
+            self._share_ybus = True
 
         if isinstance(paths, (str, Path)):
             paths = [paths]
@@ -248,44 +324,109 @@ class ChanghunDataset(Dataset):
         N = int(r["bus_number"])
         nl = int(r["branch_number"])
 
-        S_base = float(r["S_base"])
+        S_base_raw = float(r["S_base"])
         U_base_scalar = float(r["U_base"])
 
+        # ---- temporary S_base rebase (per-unit scale normalization) ----
+        # See __init__ for rationale. Only active when per_unit=True and a
+        # target_S_base was set. Mathematically equivalent to a base change:
+        # V_pu unchanged, Y_pu and S_pu scale by (S_raw / S_target), and the
+        # power-flow equation S = V * conj(Y V) is preserved (both sides scale
+        # by the same factor). The model sees identical physics but on a
+        # numerical scale matching the IEEE/PEGASE training regime.
+        if self._per_unit and self._target_S_base is not None:
+            S_base = self._target_S_base
+        else:
+            S_base = S_base_raw
+
+        # =================================================================
+        # share_grid FAST PATH: cache is already populated for the grid.
+        # Skip every grid-related parquet decode, per-unit math, dense Y
+        # reconstruction, and tensor allocation. Only read the
+        # perturbation-dependent columns (u_*, S_*), do their per-unit math
+        # using the cached Vbase_bus, and splice the cached grid tensors
+        # into the returned row dict.
+        # =================================================================
+        if self._share_grid and self._shared_grid_tensors:
+            Vbase_bus_cached = self._shared_grid_numpy["Vbase_bus"]
+            u_start_p = _as_np(r["u_start"], self._complex_np_dtype).reshape(N)
+            u_newton_p = _as_np(r["u_newton"], self._complex_np_dtype).reshape(N)
+            S_start_p = _as_np(r["S_start"], self._complex_np_dtype).reshape(N)
+            S_newton_p = _as_np(r["S_newton"], self._complex_np_dtype).reshape(N)
+            if self._per_unit:
+                u_start_p = u_si_to_pu_per_bus(u_start_p, Vbase_bus_cached, self._complex_np_dtype)
+                u_newton_p = u_si_to_pu_per_bus(u_newton_p, Vbase_bus_cached, self._complex_np_dtype)
+                S_start_p = s_si_to_pu(S_start_p, S_base, self._complex_np_dtype)
+                S_newton_p = s_si_to_pu(S_newton_p, S_base, self._complex_np_dtype)
+            V_start_p = np.stack(
+                [np.abs(u_start_p).astype(self._real_np_dtype),
+                 np.angle(u_start_p).astype(self._real_np_dtype)],
+                axis=1,
+            )
+            V_newton_p = np.stack(
+                [np.abs(u_newton_p).astype(self._real_np_dtype),
+                 np.angle(u_newton_p).astype(self._real_np_dtype)],
+                axis=1,
+            )
+            row: Dict[str, Any] = {
+                "N": N,
+                "nl": nl,
+                "S_base": to_t(np.array(S_base, dtype=self._real_np_dtype), dtype=self._real_torch_dtype),
+                "U_base": to_t(np.array(U_base_scalar, dtype=self._real_np_dtype), dtype=self._real_torch_dtype),
+                "U_start": to_t(u_start_p, dtype=self._complex_torch_dtype),
+                "U_newton": to_t(u_newton_p, dtype=self._complex_torch_dtype),
+                "V_start": to_t(V_start_p, dtype=self._real_torch_dtype),
+                "V_newton": to_t(V_newton_p, dtype=self._real_torch_dtype),
+                "S_start": to_t(S_start_p, dtype=self._complex_torch_dtype),
+                "S_newton": to_t(S_newton_p, dtype=self._complex_torch_dtype),
+            }
+            row.update(self._shared_grid_tensors)
+            return row
+
         bus_typ = _as_np(r["bus_typ"], np.int64).reshape(N)
-        vn_kv = _as_np(r["vn_kv"], FLOAT_DTYPE).reshape(N)
+        vn_kv = _as_np(r["vn_kv"], self._real_np_dtype).reshape(N)
         Vbase_bus = (vn_kv.astype(np.float64) * 1e3).astype(np.float64)
 
-        Y_shunt_bus = _as_np(r["Y_shunt_bus"], COMPLEX_DTYPE).reshape(N)
+        Y_shunt_bus = _as_np(r["Y_shunt_bus"], self._complex_np_dtype).reshape(N)
 
         Branch_f_bus = _as_np(r["Branch_f_bus"], np.int64).reshape(nl)
         Branch_t_bus = _as_np(r["Branch_t_bus"], np.int64).reshape(nl)
         Branch_status = _as_np(r["Branch_status"], np.int8).reshape(nl)
-        Branch_tau = _as_np(r["Branch_tau"], FLOAT_DTYPE).reshape(nl)
-        Branch_shift_deg = _as_np(r["Branch_shift_deg"], FLOAT_DTYPE).reshape(nl)
+        Branch_tau = _as_np(r["Branch_tau"], self._real_np_dtype).reshape(nl)
+        Branch_shift_deg = _as_np(r["Branch_shift_deg"], self._real_np_dtype).reshape(nl)
 
-        Branch_y_series_from = _as_np(r["Branch_y_series_from"], COMPLEX_DTYPE).reshape(nl)
-        Branch_y_series_to = _as_np(r["Branch_y_series_to"], COMPLEX_DTYPE).reshape(nl)
-        Branch_y_series_ft = _as_np(r["Branch_y_series_ft"], COMPLEX_DTYPE).reshape(nl)
+        Branch_y_series_from = _as_np(r["Branch_y_series_from"], self._complex_np_dtype).reshape(nl)
+        Branch_y_series_to = _as_np(r["Branch_y_series_to"], self._complex_np_dtype).reshape(nl)
+        Branch_y_series_ft = _as_np(r["Branch_y_series_ft"], self._complex_np_dtype).reshape(nl)
 
-        Branch_y_shunt_from = _as_np(r["Branch_y_shunt_from"], COMPLEX_DTYPE).reshape(nl)
-        Branch_y_shunt_to = _as_np(r["Branch_y_shunt_to"], COMPLEX_DTYPE).reshape(nl)
+        Branch_y_shunt_from = _as_np(r["Branch_y_shunt_from"], self._complex_np_dtype).reshape(nl)
+        Branch_y_shunt_to = _as_np(r["Branch_y_shunt_to"], self._complex_np_dtype).reshape(nl)
 
         Is_trafo = _as_np(r["Is_trafo"], np.int8).reshape(nl)
         Branch_hv_is_f = _as_np(r["Branch_hv_is_f"], np.int8).reshape(nl)
-        Branch_n = _as_np(r["Branch_n"], FLOAT_DTYPE).reshape(nl)
+        Branch_n = _as_np(r["Branch_n"], self._real_np_dtype).reshape(nl)
 
-        Y_Lines = _as_np(r["Y_Lines"], COMPLEX_DTYPE).reshape(nl)
-        Y_C_Lines = _as_np(r["Y_C_Lines"], FLOAT_DTYPE).reshape(nl)
+        Y_Lines = _as_np(r["Y_Lines"], self._complex_np_dtype).reshape(nl)
+        Y_C_Lines = _as_np(r["Y_C_Lines"], self._real_np_dtype).reshape(nl)
 
-        u_start = _as_np(r["u_start"], COMPLEX_DTYPE).reshape(N)
-        u_newton = _as_np(r["u_newton"], COMPLEX_DTYPE).reshape(N)
-        S_start = _as_np(r["S_start"], COMPLEX_DTYPE).reshape(N)
-        S_newton = _as_np(r["S_newton"], COMPLEX_DTYPE).reshape(N)
+        u_start = _as_np(r["u_start"], self._complex_np_dtype).reshape(N)
+        u_newton = _as_np(r["u_newton"], self._complex_np_dtype).reshape(N)
+        S_start = _as_np(r["S_start"], self._complex_np_dtype).reshape(N)
+        S_newton = _as_np(r["S_newton"], self._complex_np_dtype).reshape(N)
 
         Ybus = None
-        if not self._no_cache_dense_ybus:
+        # Fast path: share_ybus=True and we've already built the shared tensor.
+        # Skip all dense Y reconstruction work and re-use the cached tensor.
+        # Caller-visible behaviour is identical because Y is grid-only data
+        # and every row in this dataset shares the same grid.
+        reuse_shared_ybus = (
+            self._share_ybus
+            and not self._no_cache_dense_ybus
+            and self._shared_ybus_tensor is not None
+        )
+        if not self._no_cache_dense_ybus and not reuse_shared_ybus:
             if "Y_matrix" in available_columns and r.get("Y_matrix", None) is not None:
-                Ybus_si = _as_np(r["Y_matrix"], COMPLEX_DTYPE).reshape(N, N)
+                Ybus_si = _as_np(r["Y_matrix"], self._complex_np_dtype).reshape(N, N)
             else:
                 Ybus_si = reconstruct_Y_pandapower_branchrows_direct_SI_np(
                     N,
@@ -295,104 +436,172 @@ class ChanghunDataset(Dataset):
                     Branch_y_shunt_from, Branch_y_shunt_to,
                     Y_shunt_bus,
                     Vbase_bus=Vbase_bus,
+                    out_dtype=self._complex_np_dtype,
                 )
 
         if self._per_unit:
-            if not self._no_cache_dense_ybus:
-                Ybus = ybus_si_to_pu(Ybus_si, Vbase_bus, S_base)
+            if not self._no_cache_dense_ybus and not reuse_shared_ybus:
+                Ybus = ybus_si_to_pu(Ybus_si, Vbase_bus, S_base, self._complex_np_dtype)
 
-            Y_shunt_bus = ysh_bus_si_to_pu(Y_shunt_bus, Vbase_bus, S_base)
+            Y_shunt_bus = ysh_bus_si_to_pu(Y_shunt_bus, Vbase_bus, S_base, self._complex_np_dtype)
 
             Vf = Vbase_bus[Branch_f_bus]
             Vt = Vbase_bus[Branch_t_bus]
 
             Branch_y_series_from = (
                 Branch_y_series_from * (Vf ** 2 / S_base)
-            ).astype(COMPLEX_DTYPE, copy=False)
+            ).astype(self._complex_np_dtype, copy=False)
 
             Branch_y_series_to = (
                 Branch_y_series_to * (Vt ** 2 / S_base)
-            ).astype(COMPLEX_DTYPE, copy=False)
+            ).astype(self._complex_np_dtype, copy=False)
 
             Branch_y_series_ft = (
                 Branch_y_series_ft * (Vf * Vt / S_base)
-            ).astype(COMPLEX_DTYPE, copy=False)
+            ).astype(self._complex_np_dtype, copy=False)
 
             Branch_y_shunt_from = (
                 Branch_y_shunt_from * (Vf ** 2 / S_base)
-            ).astype(COMPLEX_DTYPE, copy=False)
+            ).astype(self._complex_np_dtype, copy=False)
 
             Branch_y_shunt_to = (
                 Branch_y_shunt_to * (Vt ** 2 / S_base)
-            ).astype(COMPLEX_DTYPE, copy=False)
+            ).astype(self._complex_np_dtype, copy=False)
 
             Y_Lines = (
                 Y_Lines * (Vf ** 2 / S_base)
-            ).astype(COMPLEX_DTYPE, copy=False)
+            ).astype(self._complex_np_dtype, copy=False)
 
             Y_C_Lines = (
                 Y_C_Lines * (Vf ** 2 / S_base)
-            ).astype(FLOAT_DTYPE, copy=False)
+            ).astype(self._real_np_dtype, copy=False)
 
-            u_start = u_si_to_pu_per_bus(u_start, Vbase_bus)
-            u_newton = u_si_to_pu_per_bus(u_newton, Vbase_bus)
+            u_start = u_si_to_pu_per_bus(u_start, Vbase_bus, self._complex_np_dtype)
+            u_newton = u_si_to_pu_per_bus(u_newton, Vbase_bus, self._complex_np_dtype)
 
-            S_start = s_si_to_pu(S_start, S_base)
-            S_newton = s_si_to_pu(S_newton, S_base)
+            S_start = s_si_to_pu(S_start, S_base, self._complex_np_dtype)
+            S_newton = s_si_to_pu(S_newton, S_base, self._complex_np_dtype)
 
-        elif not self._no_cache_dense_ybus:
-            Ybus = Ybus_si.astype(COMPLEX_DTYPE, copy=False)
+        elif not self._no_cache_dense_ybus and not reuse_shared_ybus:
+            Ybus = Ybus_si.astype(self._complex_np_dtype, copy=False)
 
         V_start = np.stack(
-            [np.abs(u_start).astype(FLOAT_DTYPE), np.angle(u_start).astype(FLOAT_DTYPE)],
+            [np.abs(u_start).astype(self._real_np_dtype), np.angle(u_start).astype(self._real_np_dtype)],
             axis=1
         )
         V_newton = np.stack(
-            [np.abs(u_newton).astype(FLOAT_DTYPE), np.angle(u_newton).astype(FLOAT_DTYPE)],
+            [np.abs(u_newton).astype(self._real_np_dtype), np.angle(u_newton).astype(self._real_np_dtype)],
             axis=1
         )
 
         row: Dict[str, Any] = {
             "N": N,
             "nl": nl,
-            "S_base": to_t(np.array(S_base, dtype=FLOAT_DTYPE), dtype=torch.float32),
-            "U_base": to_t(np.array(U_base_scalar, dtype=FLOAT_DTYPE), dtype=torch.float32),
+            "S_base": to_t(np.array(S_base, dtype=self._real_np_dtype), dtype=self._real_torch_dtype),
+            "U_base": to_t(np.array(U_base_scalar, dtype=self._real_np_dtype), dtype=self._real_torch_dtype),
 
             "bus_type": to_t(bus_typ, dtype=torch.int64),
-            "vn_kv": to_t(vn_kv, dtype=torch.float32),
-            "V_base_bus": to_t(Vbase_bus.astype(FLOAT_DTYPE), dtype=torch.float32),
-            "Y_shunt_bus": to_t(Y_shunt_bus, dtype=torch.complex64),
+            "vn_kv": to_t(vn_kv, dtype=self._real_torch_dtype),
+            "V_base_bus": to_t(Vbase_bus.astype(self._real_np_dtype), dtype=self._real_torch_dtype),
+            "vn_log": to_t(np.log10(vn_kv.astype(np.float32) + 1e-9), dtype=torch.float32),
+            "Y_shunt_bus": to_t(Y_shunt_bus, dtype=self._complex_torch_dtype),
 
             "Branch_f_bus": to_t(Branch_f_bus, dtype=torch.int64),
             "Branch_t_bus": to_t(Branch_t_bus, dtype=torch.int64),
             "Branch_status": to_t(Branch_status, dtype=torch.int8),
-            "Branch_tau": to_t(Branch_tau, dtype=torch.float32),
-            "Branch_shift_deg": to_t(Branch_shift_deg, dtype=torch.float32),
+            "Branch_tau": to_t(Branch_tau, dtype=self._real_torch_dtype),
+            "Branch_shift_deg": to_t(Branch_shift_deg, dtype=self._real_torch_dtype),
 
-            "Branch_y_series_from": to_t(Branch_y_series_from, dtype=torch.complex64),
-            "Branch_y_series_to": to_t(Branch_y_series_to, dtype=torch.complex64),
-            "Branch_y_series_ft": to_t(Branch_y_series_ft, dtype=torch.complex64),
-            "Branch_y_shunt_from": to_t(Branch_y_shunt_from, dtype=torch.complex64),
-            "Branch_y_shunt_to": to_t(Branch_y_shunt_to, dtype=torch.complex64),
+            "Branch_y_series_from": to_t(Branch_y_series_from, dtype=self._complex_torch_dtype),
+            "Branch_y_series_to": to_t(Branch_y_series_to, dtype=self._complex_torch_dtype),
+            "Branch_y_series_ft": to_t(Branch_y_series_ft, dtype=self._complex_torch_dtype),
+            "Branch_y_shunt_from": to_t(Branch_y_shunt_from, dtype=self._complex_torch_dtype),
+            "Branch_y_shunt_to": to_t(Branch_y_shunt_to, dtype=self._complex_torch_dtype),
 
             "Is_trafo": to_t(Is_trafo, dtype=torch.int8),
             "Branch_hv_is_f": to_t(Branch_hv_is_f, dtype=torch.int8),
-            "Branch_n": to_t(Branch_n, dtype=torch.float32),
+            "Branch_n": to_t(Branch_n, dtype=self._real_torch_dtype),
 
-            "Y_Lines": to_t(Y_Lines, dtype=torch.complex64),
-            "Y_C_Lines": to_t(Y_C_Lines, dtype=torch.float32),
+            "Y_Lines": to_t(Y_Lines, dtype=self._complex_torch_dtype),
+            "Y_C_Lines": to_t(Y_C_Lines, dtype=self._real_torch_dtype),
 
-            "U_start": to_t(u_start, dtype=torch.complex64),
-            "U_newton": to_t(u_newton, dtype=torch.complex64),
-            "V_start": to_t(V_start, dtype=torch.float32),
-            "V_newton": to_t(V_newton, dtype=torch.float32),
-            "S_start": to_t(S_start, dtype=torch.complex64),
-            "S_newton": to_t(S_newton, dtype=torch.complex64),
+            "U_start": to_t(u_start, dtype=self._complex_torch_dtype),
+            "U_newton": to_t(u_newton, dtype=self._complex_torch_dtype),
+            "V_start": to_t(V_start, dtype=self._real_torch_dtype),
+            "V_newton": to_t(V_newton, dtype=self._real_torch_dtype),
+            "S_start": to_t(S_start, dtype=self._complex_torch_dtype),
+            "S_newton": to_t(S_newton, dtype=self._complex_torch_dtype),
         }
         if not self._no_cache_dense_ybus:
-            row["Ybus"] = to_t(Ybus, dtype=torch.complex64)
+            if reuse_shared_ybus:
+                # Reuse the cached tensor. Tensors returned by __getitem__ are
+                # only READ by the collate function (block_diag / stacking)
+                # and the model forward, neither of which mutates Ybus -- so
+                # sharing one tensor across all dataset rows is safe.
+                row["Ybus"] = self._shared_ybus_tensor
+            else:
+                ybus_t = to_t(Ybus, dtype=self._complex_torch_dtype)
+                row["Ybus"] = ybus_t
+                if self._share_ybus and self._shared_ybus_tensor is None:
+                    self._shared_ybus_tensor = ybus_t
+                    print(
+                        f"[Dataset]   share_ybus=True: cached shared Ybus from "
+                        f"first row (N={N}, |Y|_pu max={ybus_t.abs().max():.3e}); "
+                        f"subsequent rows will skip dense Y reconstruction"
+                    )
+
+        # share_grid first-row population: cache every grid-only tensor so
+        # subsequent calls take the fast path at the top of this function.
+        # Triggered only on the very first build (cache empty).
+        if self._share_grid and not self._shared_grid_tensors:
+            grid_field_names = [
+                "bus_type", "vn_kv", "vn_log", "V_base_bus", "Y_shunt_bus",
+                "Branch_f_bus", "Branch_t_bus", "Branch_status",
+                "Branch_tau", "Branch_shift_deg",
+                "Branch_y_series_from", "Branch_y_series_to", "Branch_y_series_ft",
+                "Branch_y_shunt_from", "Branch_y_shunt_to",
+                "Is_trafo", "Branch_hv_is_f", "Branch_n",
+                "Y_Lines", "Y_C_Lines",
+            ]
+            if not self._no_cache_dense_ybus:
+                grid_field_names.append("Ybus")
+            for name in grid_field_names:
+                if name in row:
+                    self._shared_grid_tensors[name] = row[name]
+            self._shared_grid_numpy["Vbase_bus"] = Vbase_bus
+            print(
+                f"[Dataset]   share_grid=True: cached "
+                f"{len(self._shared_grid_tensors)} grid-only tensors from "
+                f"first row (Ybus + Branch_y_* + topology + vn_kv + ...); "
+                f"subsequent rows skip parquet decode + per-unit math for "
+                f"these fields"
+            )
 
         return row
+
+    def _print_sbase_diagnostic(self, path, S_base_raw: float) -> None:
+        """One-shot diagnostic: warn if the parquet's S_base disagrees with the
+        target rebase value. Helps users notice scale mismatches that would
+        otherwise silently break training (Armijo reject / pure-PINN diverge).
+        """
+        print(f"[Dataset] {path}")
+        print(f"[Dataset]   parquet S_base = {S_base_raw:.3e} VA "
+              f"(= {S_base_raw/1e6:.4g} MVA)")
+        if self._per_unit and self._target_S_base is not None:
+            if abs(S_base_raw - self._target_S_base) > 1.0:
+                ratio = S_base_raw / self._target_S_base
+                print(f"[Dataset]   per-unit S_base REBASED to "
+                      f"{self._target_S_base:.3e} VA "
+                      f"(= {self._target_S_base/1e6:.4g} MVA); "
+                      f"S_pu/Y_pu scaled by {ratio:.3g}x")
+            else:
+                print(f"[Dataset]   per-unit S_base matches target "
+                      f"({self._target_S_base/1e6:.4g} MVA); no rebase")
+        elif self._per_unit:
+            print(f"[Dataset]   per-unit conversion uses parquet S_base as-is "
+                  f"(target_S_base=None)")
+        else:
+            print(f"[Dataset]   per_unit=False; S_base unused in conversion")
 
     def _load_eager_rows(self, paths: List[Union[str, Path]]) -> None:
         all_dfs = []
@@ -406,6 +615,9 @@ class ChanghunDataset(Dataset):
             df = decode_columns_mp_columnwise(df, binary_cols)
             print(f"Decoded columns from {path}: {binary_cols}")
             print(f"Raw shape: {df.shape}")
+
+            if "S_base" in df.columns and len(df) > 0:
+                self._print_sbase_diagnostic(path, float(df.iloc[0]["S_base"]))
 
             if "u_newton" in df.columns:
                 keep_mask = ~df["u_newton"].map(_all_zero_complex_fast).to_numpy()
@@ -439,6 +651,15 @@ class ChanghunDataset(Dataset):
             print(f"Indexing parquet lazily from {path} ...")
             parquet_file = pq.ParquetFile(str(path))
             self._parquet_files.append(parquet_file)
+
+            # One-shot S_base diagnostic: read just the S_base column from
+            # the first row group so we can warn about scale mismatches
+            # without loading the heavy binary columns.
+            if "S_base" in parquet_file.schema.names and parquet_file.num_row_groups > 0:
+                sb_table = parquet_file.read_row_group(0, columns=["S_base"])
+                sb_list = sb_table.column("S_base").to_pylist()
+                if sb_list:
+                    self._print_sbase_diagnostic(path, float(sb_list[0]))
 
             file_valid = 0
             file_removed = 0

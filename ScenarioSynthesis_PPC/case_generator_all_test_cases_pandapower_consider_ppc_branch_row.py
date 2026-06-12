@@ -191,6 +191,41 @@ def _apply_model_a_cgmes_cleanup(net) -> None:
             net.gen.loc[bad_vm, "vm_pu"] = 1.0
 
 
+def _apply_line_outages(net, prob: float, rng) -> bool:
+    """
+    Randomly take lines out of service with per-line probability `prob`.
+    After applying outages, checks connectivity via unsupplied_buses(); if any
+    bus becomes unreachable from the slack, all outages are restored and the
+    function returns False.  Returns True when at least one outage sticks.
+    """
+    if prob <= 0.0 or not hasattr(net, "line") or len(net.line) == 0:
+        return False
+
+    active_idx = net.line.index[net.line["in_service"].to_numpy(bool)]
+    if len(active_idx) == 0:
+        return False
+
+    outage_mask = rng.random(len(active_idx)) < prob
+    outaged = active_idx[outage_mask]
+    if len(outaged) == 0:
+        return False
+
+    net.line.loc[outaged, "in_service"] = False
+
+    try:
+        from pandapower.topology import unsupplied_buses
+        isolated = unsupplied_buses(net)
+        if len(isolated) > 0:
+            net.line.loc[outaged, "in_service"] = True
+            return False
+    except Exception:
+        # If the topology check itself fails, be conservative and restore
+        net.line.loc[outaged, "in_service"] = True
+        return False
+
+    return True
+
+
 def _has_conflicting_voltage_controllers(net) -> bool:
     """
     Return True if multiple voltage-controlling elements share a bus.
@@ -479,6 +514,11 @@ def _build_manual_flat_start(
 def _build_dc_compile_start(
     net,
     Vbase: np.ndarray,
+    bus_typ: Optional[np.ndarray] = None,
+    rand_u_start: bool = False,
+    angle_jitter_deg: float = 0.0,
+    mag_jitter_pq: float = 0.0,
+    rng=None,
 ) -> np.ndarray:
     """
     Build start voltage from a DC compile on a copy of the same net.
@@ -486,6 +526,14 @@ def _build_dc_compile_start(
 
     This does NOT rely on ppc_int['V0'], because some pandapower versions
     do not store V0 after rundcpp().
+
+    Optional start-noise (applied on top of the DC solution):
+      rand_u_start    : enable angle and magnitude noise
+      angle_jitter_deg: uniform angle noise on non-slack buses  [degrees]
+      mag_jitter_pq   : uniform magnitude noise on PQ buses     [fraction]
+      bus_typ         : bus type array (1=slack, 2=PV, 3=PQ) — required
+                        for noise to be applied
+      rng             : numpy Generator; if None, uses np.random.default_rng()
     """
     import pandapower as pp
     from pandapower.pypower.idx_bus import VA
@@ -528,6 +576,35 @@ def _build_dc_compile_start(
             if 0 <= b < N and np.isfinite(vm) and vm > 0:
                 mag_pu[b] = vm
 
+    # ----------------------------------------------------------------
+    # Optional start-point noise on top of the DC solution
+    # ----------------------------------------------------------------
+    if rand_u_start and bus_typ is not None:
+        if rng is None:
+            rng = np.random.default_rng()
+
+        bus_typ_arr = np.asarray(bus_typ)
+
+        # Angle noise: all non-slack buses (PV + PQ)
+        if angle_jitter_deg > 0:
+            non_slack = (bus_typ_arr != 1)
+            if non_slack.any():
+                ang[non_slack] += rng.uniform(
+                    -angle_jitter_deg,
+                    angle_jitter_deg,
+                    size=int(non_slack.sum()),
+                ) * np.pi / 180.0
+
+        # Magnitude noise: PQ buses only
+        if mag_jitter_pq > 0:
+            pq_mask = (bus_typ_arr == 3)
+            if pq_mask.any():
+                mag_pu[pq_mask] *= rng.uniform(
+                    1.0 - mag_jitter_pq,
+                    1.0 + mag_jitter_pq,
+                    size=int(pq_mask.sum()),
+                )
+
     return (mag_pu * np.exp(1j * ang)) * Vbase
 
 
@@ -543,6 +620,7 @@ def case_generation_pandapower(
     cgmes_model_a_cleanup: bool = False,
     seed=None,
     jitter_load: float = 0.0,
+    jitter_load_q: float = 0.0,
     jitter_gen: float = 0.0,
     pv_vset_range=None,
     rand_u_start: bool = False,
@@ -552,6 +630,10 @@ def case_generation_pandapower(
     trafo_i0_percent: Optional[float] = None,
     force_branch_shunt_pu: Optional[Dict[str, float]] = None,
     start_mode: str = "auto",  # "auto", "manual_flat", "ppc_v0", "dc_compile"
+    # Operating-point diversity
+    load_scale_range=None,        # e.g. (0.7, 1.3) — global correlated load scale
+    scale_gen_with_load: bool = True,  # apply same global scale to PV gen p_mw
+    line_outage_prob: float = 0.0,     # per-line probability of N-1 outage
 ):
     """
     Generic pandapower/CGMES case generator with ONE metadata row per PPC branch row.
@@ -631,11 +713,41 @@ def case_generation_pandapower(
         if trafo_i0_percent is not None:
             net.trafo.loc[:, "i0_percent"] = float(trafo_i0_percent)
 
-    # optional load jitter
+    # ------------------------------------------------------------
+    # Global correlated load scale  (moves the operating point)
+    # Applied BEFORE per-bus jitter so the two effects are additive.
+    # Gens are scaled by the same factor to keep generation roughly
+    # balanced with load; the slack only has to absorb the small
+    # per-bus jitter mismatch, not a large global imbalance.
+    # ------------------------------------------------------------
+    if load_scale_range is not None:
+        lo, hi = load_scale_range
+        global_scale = float(rng.uniform(lo, hi))
+        global_scale = max(global_scale, 0.05)   # safety clamp — never negative/zero
+
+        if hasattr(net, "load") and len(net.load):
+            net.load["p_mw"]   = net.load["p_mw"].to_numpy(float)   * global_scale
+            net.load["q_mvar"] = net.load["q_mvar"].to_numpy(float) * global_scale
+
+        if scale_gen_with_load and hasattr(net, "gen") and len(net.gen):
+            net.gen["p_mw"] = np.maximum(
+                net.gen["p_mw"].to_numpy(float) * global_scale, 0.0
+            )
+
+    # ------------------------------------------------------------
+    # N-1 line outages (topology diversity)
+    # Applied BEFORE compilation so the compiled Y_matrix and
+    # Branch_status reflect the actual in-service topology.
+    # ------------------------------------------------------------
+    _apply_line_outages(net, prob=line_outage_prob, rng=rng)
+
+    # optional load jitter — P and Q are drawn independently so power factor varies
     if jitter_load > 0 and hasattr(net, "load") and len(net.load):
-        s = rng.normal(1.0, jitter_load, size=len(net.load))
-        net.load["p_mw"] = net.load["p_mw"].to_numpy(float) * s
-        net.load["q_mvar"] = net.load["q_mvar"].to_numpy(float) * s
+        s_p = rng.normal(1.0, jitter_load, size=len(net.load))
+        net.load["p_mw"] = net.load["p_mw"].to_numpy(float) * s_p
+    if jitter_load_q > 0 and hasattr(net, "load") and len(net.load):
+        s_q = rng.normal(1.0, jitter_load_q, size=len(net.load))
+        net.load["q_mvar"] = net.load["q_mvar"].to_numpy(float) * s_q
 
     # optional generator active-power jitter
     if jitter_gen > 0 and hasattr(net, "gen") and len(net.gen):
@@ -823,7 +935,15 @@ def case_generation_pandapower(
         u_start = np.asarray(ppc_int["V0"], dtype=np.complex128) * Vbase
 
     elif start_mode == "dc_compile":
-        u_start = _build_dc_compile_start(net=net, Vbase=Vbase)
+        u_start = _build_dc_compile_start(
+            net=net,
+            Vbase=Vbase,
+            bus_typ=bus_typ,
+            rand_u_start=rand_u_start,
+            angle_jitter_deg=angle_jitter_deg,
+            mag_jitter_pq=mag_jitter_pq,
+            rng=rng,
+        )
 
     # ------------------------------------------------------------
     # 9) One metadata row per PPC branch row
