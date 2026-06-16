@@ -164,6 +164,11 @@ parser.add_argument("--max_test_samples", type=int, default=0, help="Cap test sp
 
 parser.add_argument('--weight_init', type=str, default="sd0.02")
 parser.add_argument('--bias_init', type=float, default=0.0)
+parser.add_argument(
+    "--preserve_zero_heads",
+    action="store_true",
+    help="Keep model output heads at their constructor zero-init instead of overwriting them in global init.",
+)
 parser.add_argument('--weight_decay', type=float, default=1e-3)
 
 parser.add_argument('--lr_scheduler', type=str, default="default", help='default | CosineAnnealingLR')
@@ -627,7 +632,7 @@ def init_weights(model, exclude_modules):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0, std=0.02)
         else:
-            for name, param in module.named_parameters():
+            for name, param in module.named_parameters(recurse=False):
                 if 'weight' in name and param.dim() > 1:
                     if args.weight_init == "sd0.02":
                         torch.nn.init.normal_(param, mean=0, std=0.02)
@@ -637,6 +642,11 @@ def init_weights(model, exclude_modules):
                     param.data.fill_(args.bias_init)
 
 exclude_modules = []
+if args.preserve_zero_heads:
+    for attr in ("theta_head", "v_head", "m_head"):
+        heads = getattr(model, attr, None)
+        if heads is not None:
+            exclude_modules.extend(list(heads.modules()))
 init_weights(model, exclude_modules)
 
 def count_parameters(model):
