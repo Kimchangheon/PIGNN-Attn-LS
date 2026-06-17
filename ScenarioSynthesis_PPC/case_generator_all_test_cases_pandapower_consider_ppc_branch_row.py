@@ -633,7 +633,14 @@ def case_generation_pandapower(
     # Operating-point diversity
     load_scale_range=None,        # e.g. (0.7, 1.3) — global correlated load scale
     scale_gen_with_load: bool = True,  # apply same global scale to PV gen p_mw
-    line_outage_prob: float = 0.0,     # per-line probability of N-1 outage
+    line_outage_prob: float = 0.0,     # per-line probability of N-1 outage (legacy bernoulli)
+    # Selectable topology / admittance perturbation (see perturbation_options.py)
+    contingency_mode: str = "none",    # "none"|"bernoulli"|"ratio"|"poisson"
+    contingency_elements=("line",),    # subset of {"line","gen"}
+    contingency_ratio_weights=(0.55, 0.27, 0.18),  # P(N-0,N-1,N-2) for "ratio"
+    contingency_poisson_q: float = 5e-4,           # per-branch unavailability for "poisson"
+    contingency_k_cap: int = 2,        # hard cap on simultaneous outages
+    admittance_sigma: float = 0.0,     # R/X jitter magnitude (0 disables)
 ):
     """
     Generic pandapower/CGMES case generator with ONE metadata row per PPC branch row.
@@ -735,11 +742,31 @@ def case_generation_pandapower(
             )
 
     # ------------------------------------------------------------
-    # N-1 line outages (topology diversity)
-    # Applied BEFORE compilation so the compiled Y_matrix and
-    # Branch_status reflect the actual in-service topology.
+    # Topology + admittance perturbation (Y_bus VARIES — share_grid=False)
+    # Applied BEFORE compilation so the compiled Y_matrix and Branch_status
+    # reflect the actual in-service topology and branch impedances.
+    #
+    # Backward compatible: if contingency_mode == "none" but the legacy
+    # line_outage_prob > 0 is set, fall back to the old per-line Bernoulli.
+    # Otherwise use the selectable sampler (ratio / poisson / bernoulli).
     # ------------------------------------------------------------
-    _apply_line_outages(net, prob=line_outage_prob, rng=rng)
+    if contingency_mode == "none" and line_outage_prob > 0.0:
+        _apply_line_outages(net, prob=line_outage_prob, rng=rng)
+    elif contingency_mode != "none":
+        from perturbation_options import sample_contingency
+        sample_contingency(
+            net, rng,
+            mode=contingency_mode,
+            elements=tuple(contingency_elements),
+            bernoulli_p=line_outage_prob,
+            ratio_weights=tuple(contingency_ratio_weights),
+            poisson_q=contingency_poisson_q,
+            k_cap=contingency_k_cap,
+        )
+
+    if admittance_sigma > 0.0:
+        from perturbation_options import apply_admittance_jitter
+        apply_admittance_jitter(net, rng, sigma=admittance_sigma)
 
     # optional load jitter — P and Q are drawn independently so power factor varies
     if jitter_load > 0 and hasattr(net, "load") and len(net.load):
