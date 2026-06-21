@@ -641,6 +641,7 @@ def case_generation_pandapower(
     contingency_poisson_q: float = 5e-4,           # per-branch unavailability for "poisson"
     contingency_k_cap: int = 2,        # hard cap on simultaneous outages
     admittance_sigma: float = 0.0,     # R/X jitter magnitude (0 disables)
+    return_pp_solution: bool = False,
 ):
     """
     Generic pandapower/CGMES case generator with ONE metadata row per PPC branch row.
@@ -1052,7 +1053,7 @@ def case_generation_pandapower(
     U_base = float(Vbase[0])
     gridtype = f"{case_name}_pandapower_{'ppcY' if ybus_mode.lower() == 'ppcy' else 'stamped'}"
 
-    return (
+    result = (
         gridtype, bus_typ, s_multi, u_start, Y_matrix, is_connected,
 
         Branch_f_bus, Branch_t_bus, Branch_status,
@@ -1068,6 +1069,37 @@ def case_generation_pandapower(
         Y_Lines, Y_C_Lines,
         U_base, S_base, vn_kv.astype(np.float64),
     )
+
+    if not return_pp_solution:
+        return result
+
+    pp_converged = False
+    u_pp_si = np.zeros(N, dtype=np.complex128)
+    S_pp_si = np.zeros(N, dtype=np.complex128)
+
+    try:
+        pp.runpp(
+            net,
+            algorithm="nr",
+            init="auto",
+            calculate_voltage_angles=True,
+            enforce_q_lims=False,
+            max_iteration=30,
+            tolerance_mva=1e-8,
+        )
+        ppci_label = net._ppc["internal"]
+        Vpu_label = np.asarray(ppci_label["V"], dtype=np.complex128)
+        if Vpu_label.shape[0] != N:
+            raise RuntimeError(
+                f"pandapower label PPC size changed from {N} to {Vpu_label.shape[0]}"
+            )
+        u_pp_si = Vpu_label * Vbase
+        S_pp_si = u_pp_si * np.conj(np.asarray(Y_matrix, dtype=np.complex128) @ u_pp_si)
+        pp_converged = bool(getattr(net, "converged", False))
+    except Exception:
+        pp_converged = False
+
+    return result + (u_pp_si, S_pp_si, pp_converged)
 
 
 def case_generation_pandapower_stamped(

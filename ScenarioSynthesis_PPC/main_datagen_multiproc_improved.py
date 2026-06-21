@@ -26,7 +26,7 @@ from case_generator_all_test_cases_pandapower_consider_ppc_branch_row import (
     case_generation_pandapower,
     case_generation_pandapower_stamped,
 )
-from newton_raphson_improved import newtonrapson
+from newton_raphson_improved import _compute_mismatch_inf, newtonrapson
 
 
 # ============================================================
@@ -405,12 +405,16 @@ def _generate_one_record_serialized() -> Dict[str, Any]:
         load_scale_range=_CFG["load_scale_range"],
         scale_gen_with_load=bool(_CFG["scale_gen_with_load"]),
         line_outage_prob=float(_CFG["line_outage_prob"]),
+        return_pp_solution=(str(_CFG.get("label_solver", "custom_nr")) == "pandapower_nr"),
     )
 
     if ybus_mode.lower() == "stamped":
         out = case_generation_pandapower_stamped(**gen_kwargs)
     else:
         out = case_generation_pandapower(ybus_mode="ppcY", **gen_kwargs)
+
+    base_out = out[:25]
+    pp_label = out[25:] if len(out) > 25 else ()
 
     (
         gridtype_out, bus_typ, s_multi, u_start, Y_matrix, is_connected,
@@ -422,7 +426,7 @@ def _generate_one_record_serialized() -> Dict[str, Any]:
         Is_trafo, Branch_hv_is_f, Branch_n,
         Y_Lines, Y_C_Lines,
         U_base, S_base, vn_kv
-    ) = out
+    ) = base_out
 
     bus_number = int(len(bus_typ))
     branch_number = int(len(Branch_f_bus))
@@ -434,9 +438,31 @@ def _generate_one_record_serialized() -> Dict[str, Any]:
     nr_final_misinf = float("nan")
     nr_iterations = 0
 
+    label_solver = str(_CFG.get("label_solver", "custom_nr"))
+
     if not is_connected:
         u_newton_si = np.zeros_like(u_start, dtype=np.complex128)
         S_newton_si = np.zeros_like(s_multi, dtype=np.complex128)
+    elif label_solver == "pandapower_nr":
+        if len(pp_label) != 3:
+            raise RuntimeError("pandapower_nr requested, but case generator did not return pandapower labels")
+
+        u_newton_si = np.asarray(pp_label[0], dtype=np.complex128)
+        S_newton_si = np.asarray(pp_label[1], dtype=np.complex128)
+        nr_converged = 1 if bool(pp_label[2]) else 0
+        nr_iterations = 0
+
+        try:
+            bus_typ_arr = np.asarray(bus_typ, dtype=np.int64).copy()
+            nr_final_misinf = _compute_mismatch_inf(
+                bus_typ_arr,
+                np.asarray(Y_matrix, dtype=np.complex128),
+                u_newton_si,
+                np.asarray(s_multi, dtype=np.complex128).real,
+                np.asarray(s_multi, dtype=np.complex128).imag,
+            )
+        except Exception:
+            nr_final_misinf = float("nan")
     else:
         bus_typ_arr = np.asarray(bus_typ, dtype=np.int64).copy()
 
@@ -697,6 +723,13 @@ def parse_args():
     parser.add_argument("--trafo_i0_percent", type=float, default=None)
 
     parser.add_argument("--pu_nr", action="store_true", help="Solve NR in per-unit, save results back in SI.")
+    parser.add_argument(
+        "--label_solver",
+        type=str,
+        default="custom_nr",
+        choices=["custom_nr", "pandapower_nr"],
+        help="Use the in-repo custom NR label solver or pandapower's converged NR solution as label.",
+    )
     parser.add_argument("--diagnose_nr", action="store_true", help="Enable NR diagnostics.")
     parser.add_argument("--print_misinf", action="store_true", help="Print NR mismatch per iteration.")
     parser.add_argument("--near_misinf_tol", type=float, default=1e-3)
@@ -816,6 +849,7 @@ def main():
         force_branch_shunt_b_asym_pu=float(args.force_branch_shunt_b_asym_pu),
 
         pu_nr=bool(args.pu_nr),
+        label_solver=str(args.label_solver).strip(),
         diagnose_nr=bool(args.diagnose_nr),
         print_misinf=bool(args.print_misinf),
         near_misinf_tol=float(args.near_misinf_tol),
@@ -861,6 +895,7 @@ def main():
     print(f"  drop_nonconverged         = {cfg['drop_nonconverged']}")
     print(f"  K                         = {args.K}")
     print(f"  pu_nr                     = {args.pu_nr}")
+    print(f"  label_solver              = {args.label_solver}")
     print(f"  start_mode                = {args.start_mode}")
     print(f"  use_force_shunt_when_no_trafo = {args.use_force_shunt_when_no_trafo}")
     print(f"  diagnose_nr               = {args.diagnose_nr}")
