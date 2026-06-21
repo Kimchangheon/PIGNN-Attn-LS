@@ -1,8 +1,9 @@
-# Running GridFM and GridSFM on SimBench and LVN Heo1
+# Running GridFM and GridSFM on SimBench, LVN Heo1, and ENTSO-E
 
 This guide explains how to reproduce the June 2026 GridFM/GridSFM experiments
 with the existing PPC parquet data loader and complex128 residual evaluation.
-It covers both SimBench and LVN Heo1, and points to the packaged checkpoints
+It covers SimBench, LVN Heo1, and the 6,051-bus ENTSO-E RealGridTest case,
+and points to the packaged checkpoints
 and logs that were copied from Alex.
 
 The important idea is that the data pipeline is unchanged:
@@ -73,7 +74,13 @@ SimBench_snapshot_envelope_manual_flat_100MVA_coupled_ppcY_manual_flat_siNR_3600
 SimBench_snapshot_envelope_dc_compile_100MVA_coupled_ppcY_dc_compile_siNR_36000_NR_branchrows_directSI.parquet
 LVN_snapshot_envelope_manual_flat_coupled_ppcY_manual_flat_siNR_36000_NR_branchrows_directSI.parquet
 LVN_snapshot_envelope_dc_compile_coupled_ppcY_dc_compile_siNR_36000_NR_branchrows_directSI.parquet
+ENTSO_E_RealGridTest_flat_start_ppcY_A_manual_flat_siNR_36000_NR_branchrows_directSI.parquet
+ENTSO_E_RealGridTest_dc_init_ppcY_A_dc_compile_siNR_36000_NR_branchrows_directSI.parquet
 ```
+
+The two ENTSO-E parquets each contain 36,000 converged cases on a fixed grid
+with 6,051 buses and 8,202 branches. Their stored base is 1 MVA; the commands
+below intentionally rebase them to 100 MVA with `--target_S_base 1e8`.
 
 On the transfer server, parquets are expected under:
 
@@ -103,6 +110,8 @@ They were also uploaded to the transfer server under:
 ```text
 ~/PIGNN-Attn-LS/ScenarioSynthesis_PPC/results/ckpt/gridfm_gridsfm_best_20260617/
 ~/PIGNN-Attn-LS/ScenarioSynthesis_PPC/results/logs/gridfm_gridsfm_best_20260617/
+~/PIGNN-Attn-LS/ScenarioSynthesis_PPC/results/ckpt/entsoe_gridfm_best_20260620/
+~/PIGNN-Attn-LS/ScenarioSynthesis_PPC/results/logs/entsoe_gridfm_best_20260620/
 ```
 
 Download them on a Windows machine:
@@ -114,6 +123,10 @@ New-Item -ItemType Directory -Force .\results\logs | Out-Null
 scp -r chkim@131.188.35.62:~/PIGNN-Attn-LS/ScenarioSynthesis_PPC/results/ckpt/gridfm_gridsfm_best_20260617 .\results\ckpt\
 
 scp -r chkim@131.188.35.62:~/PIGNN-Attn-LS/ScenarioSynthesis_PPC/results/logs/gridfm_gridsfm_best_20260617 .\results\logs\
+
+scp -r chkim@131.188.35.62:~/PIGNN-Attn-LS/ScenarioSynthesis_PPC/results/ckpt/entsoe_gridfm_best_20260620 .\results\ckpt\
+
+scp -r chkim@131.188.35.62:~/PIGNN-Attn-LS/ScenarioSynthesis_PPC/results/logs/entsoe_gridfm_best_20260620 .\results\logs\
 ```
 
 Available checkpoint groups:
@@ -124,6 +137,7 @@ Available checkpoint groups:
 | `lvn_gridsfm_a10080_20260616_0945` | GridSFM LVN pre-FT flat/DC, scratch flat |
 | `simbench_gridfm_gridsfm_a40_20260616_1025` | GridFM SimBench flat, GridSFM SimBench flat pre-FT/scratch |
 | `simbench_dc_gridfm_gridsfm_a40_20260616_200625` | GridFM SimBench DC |
+| `entsoe_gridfm_best_20260620` | GridFM ENTSO-E flat/DC scratch, best checkpoints after 12 epochs |
 
 Note: the LVN GridSFM scratch-DC log is present, but its checkpoint was not in
 the copied-back checkpoint directory at packaging time.
@@ -148,6 +162,10 @@ completed test-set evaluations.
 | SimBench | GridSFM | flat scratch | final test | 4.068e-1 | 23.304 | 3.795 | 0.491 | 3.79e-1 | 1.17e-1 | 1.302 | 3.04e-1 |
 | SimBench | GridSFM | DC pre-FT | best valid ep10 | 4.144e-1 | 23.737 | 3.795 | 0.445 | 4.08e-1 | 1.18e-1 | 1.336 | 2.91e-1 |
 | SimBench | GridSFM | DC scratch | best valid ep1 | 4.059e-1 | 23.213 | 3.967 | 0.471 | 3.80e-1 | 6.38e-2 | 1.350 | 2.27e-1 |
+| ENTSO-E | GridFM | flat scratch, 12/40 epochs | best valid ep9 | 4.107e-2 | 2.318 | 17.70 | 15.35 | 3.04e-1 | 1.33e-1 | 1.078 | 3.99e-1 |
+| ENTSO-E | GridFM | DC scratch, 12/40 epochs | best valid ep12 | 1.858e-2 | 1.000 | 12.62 | 12.48 | 2.08e-1 | 1.01e-1 | 7.41e-1 | 2.87e-1 |
+| ENTSO-E | GridFM | flat scratch, best checkpoint | final test | 4.155e-2 | 2.346 | 17.74 | 15.43 | 3.04e-1 | 1.33e-1 | 1.080 | 4.00e-1 |
+| ENTSO-E | GridFM | DC scratch, best checkpoint | final test | 1.853e-2 | 0.997 | 12.66 | 12.54 | 2.07e-1 | 1.01e-1 | 7.37e-1 | 2.89e-1 |
 
 Best current takeaways:
 
@@ -157,6 +175,9 @@ Best current takeaways:
   depending whether active or reactive infinity residual is prioritized.
 - GridSFM reduces residuals after training, but its voltage-angle RMSE remains
   much worse than GridFM on both SimBench and LVN Heo1.
+- The ENTSO-E jobs reached the 24-hour walltime after epoch 12, so they are
+  partial training results rather than converged 40-epoch comparisons. DC
+  initialization was clearly stronger than flat initialization at that point.
 
 ## 5. GridFM Training Command
 
@@ -254,6 +275,33 @@ For LVN Heo1:
 3. GridSFM scratch flat/DC: useful low-residual validation snapshots, but angle
    error remains larger than GridFM.
 
+For ENTSO-E RealGridTest:
+
+1. Prefer the DC-start GridFM checkpoint: it has the best voltage and residual
+   metrics of the two partial runs.
+2. Use `BATCH 1` as the conservative reproducible setting for the 6,051-bus
+   graph. Larger batches should be profiled before committing a long job.
+3. Split with seed 42 and ratios 0.3333/0.3333 gives 11,998 training, 11,998
+   validation, and 12,004 test cases.
+
+Example ENTSO-E DC-start command:
+
+```powershell
+python -u train_valid_test_gridfm.py `
+  --PARQUET "C:\data\ENTSO_E_RealGridTest_dc_init_ppcY_A_dc_compile_siNR_36000_NR_branchrows_directSI.parquet" `
+  --run_name gridfm312_entsoe_dc_scratch_L12_h48_nh8_b1_sbase100M `
+  --log_to_file --log_dir ".\results\logs\entsoe_gridfm_dc" `
+  --ckpt_dir ".\results\ckpt\entsoe_gridfm_dc" `
+  --PER_UNIT --target_S_base 1e8 --share_grid --lazy_parquet --row_group_cache_size 1 `
+  --dataset_complex_dtype complex128 `
+  --BATCH 1 --EPOCHS 40 --LR 5e-4 `
+  --train_ratio 0.3333 --valid_ratio 0.3333 --seed_value 42 `
+  --hidden_size 48 --num_layers 12 --n_heads 8 `
+  --zero_init_head --vn_feature_mode log --feature_transform signed_log `
+  --mse_weight 1.0 --physics_weight 1e-2 `
+  --physics_loss_form logcosh --VAL_EVERY 1
+```
+
 ## 8. Notes on Checkpoint Reuse
 
 GridFM supports direct checkpoint warm-start through `--init_checkpoint`.
@@ -263,4 +311,3 @@ the end of that run. The saved GridSFM checkpoints are included for archival and
 future evaluation, but direct checkpoint-only evaluation would need adding an
 `--init_checkpoint` argument to `train_valid_test_gridsfm.py`, similar to the
 GridFM script.
-

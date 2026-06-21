@@ -382,6 +382,8 @@ def ppc_physics_loss(Y, Vpred, Sset, bus_type, form="logcosh", huber_delta=1.0):
 
 
 def residual_distribution(dp_values, dq_values, tol_pu):
+    max_quantile_points = 2_000_000
+
     def summarize(chunks):
         if not chunks:
             return {
@@ -404,11 +406,20 @@ def residual_distribution(dp_values, dq_values, tol_pu):
                 "frac": 0.0,
                 "n": 0,
             }
+        qx = x
+        if x.numel() > max_quantile_points:
+            idx = torch.linspace(
+                0,
+                x.numel() - 1,
+                steps=max_quantile_points,
+                device=x.device,
+            ).long().clamp_max(x.numel() - 1)
+            qx = x[idx]
         return {
             "mean": float(x.mean().item()),
-            "median": float(torch.quantile(x, 0.50).item()),
-            "p95": float(torch.quantile(x, 0.95).item()),
-            "p99": float(torch.quantile(x, 0.99).item()),
+            "median": float(torch.quantile(qx, 0.50).item()),
+            "p95": float(torch.quantile(qx, 0.95).item()),
+            "p99": float(torch.quantile(qx, 0.99).item()),
             "rmse": float(torch.sqrt(torch.mean(x * x)).item()),
             "frac": float((x < tol_pu).float().mean().item()),
             "n": int(x.numel()),
